@@ -1,0 +1,226 @@
+.
+├── .DS_Store
+├── backend_tree.txt
+├── data
+│   ├── .DS_Store
+│   └── announcements
+│       ├── .DS_Store
+│       └── 2025-10-11
+├── input_data
+│   ├── .DS_Store
+│   ├── csv
+│   │   ├── .DS_Store
+│   │   ├── eod_csv
+│   │   ├── processed_csv
+│   │   └── static
+│   │       └── broad_and_sector_indices.csv
+│   ├── images
+│   │   ├── .DS_Store
+│   │   ├── processed_images
+│   │   │   ├── .DS_Store
+│   │   │   ├── processed_banners
+│   │   │   │   └── .DS_Store
+│   │   │   └── processed_logos
+│   │   │       └── .DS_Store
+│   │   └── raw_images
+│   │       ├── .DS_Store
+│   │       ├── raw_banners
+│   │       │   ├── INFY_banner.jpeg
+│   │       │   ├── MARUTI.jpeg
+│   │       │   ├── TCS.jpeg
+│   │       │   ├── TIPSMUSIC.jpeg
+│   │       │   └── default.jpg
+│   │       └── raw_logos
+│   │           ├── ADANIPORTS.png
+│   │           ├── ADANIPOWER.jpeg
+│   │           ├── AIRTELPP.png
+│   │           ├── AXISBANK.png
+│   │           ├── BAJAJFINSV.jpeg
+│   │           ├── BAJFINANCE.jpeg
+│   │           ├── BGRENERGY.png
+│   │           ├── BPCL.jpg
+│   │           ├── CUBEXTUB.png
+│   │           ├── DMART.jpeg
+│   │           ├── ETERNAL.avif
+│   │           ├── HAL.jpeg
+│   │           ├── HCLTECH.png
+│   │           ├── HINDUNILVR.png
+│   │           ├── ICICIBANK.jpeg
+│   │           ├── ITC.png
+│   │           ├── KOTAKBANK.png
+│   │           ├── LEMONTREE.jpeg
+│   │           ├── LICI.jpeg
+│   │           ├── LT.jpeg
+│   │           ├── M&M.png
+│   │           ├── MARUTI.png
+│   │           ├── NTPC.png
+│   │           ├── RELIANCE.png
+│   │           ├── RELIANCE.svg
+│   │           ├── SBIN.jpeg
+│   │           ├── SUNPHARMA.png
+│   │           ├── TCS.webp
+│   │           ├── TIPSMUSIC.jpeg
+│   │           ├── TITAN.png
+│   │           ├── ULTRACEMCO.png
+│   │           └── YESBANK.png
+│   └── pdf
+│       ├── .DS_Store
+│       ├── AXIS Bank Ltd_03-10-2025 16_26_34.pdf
+│       ├── Adani Enterprises Ltd_04-10-2025 22_50_02.pdf
+│       ├── Anand Rathi Wealth Ltd_06-10-2025 19_18_11.pdf
+│       ├── Anzen India Energy Yield Plus Trust_01-10-2025 16_14_52.pdf
+│       ├── Astec Lifesciences Ltd_06-10-2025 19_11_08.pdf
+│       ├── BGR Energy Systems Ltd_30-09-2025 17_38_58.pdf
+│       ├── BPCL_26-09-2025 22_42_51.pdf
+│       ├── Bajaj Auto Ltd_01-10-2025 08_58_37.pdf
+│       ├── Bajaj Finance Ltd_04-10-2025 16_43_41.pdf
+│       ├── Bajaj Finance Ltd_29-09-2025 12_00_27.pdf
+│       ├── Bajaj Finserv Ltd_26-09-2025 20_16_19.pdf
+│       ├── Bank of Baroda_05-10-2025 12_54_10.pdf
+│       ├── CRISIL_01102025235903_SignedBSENSE.pdf
+│       ├── CSB Bank Ltd_09-10-2025 23_32_31.pdf
+│       ├── Canara Bank_05-10-2025 10_34_58.pdf
+│       ├── Centrum Capital Ltd_30-09-2025 14_43_17.pdf
+│       ├── Cityman Ltd_01-10-2025 16_03_59.pdf
+│       ├── Concord Control Systems Ltd_08-10-2025 22_53_40.pdf
+│       ├── Concord Drugs Ltd_01-10-2025 16_12_13.pdf
+│       ├── Confidence Petroleum India Ltd_05-10-2025 11_24_32.pdf
+│       ├── Cubex Tubings Ltd_26-09-2025 23_25_46.pdf
+│       ├── Deccan Health Care Ltd_01-10-2025 16_03_24.pdf
+│       ├── Delphi World Money Ltd_05-10-2025 10_44_17.pdf
+│       ├── Edvenswa Enterprises Ltd_02-10-2025 00_00_38.pdf
+│       ├── Eicher Motors Ltd_08-10-2025 22_47_07.pdf
+│       ├── Force Motors Ltd_05-10-2025 10_25_10.pdf
+│       ├── Foseco India Ltd_01-10-2025 23_40_57.pdf
+│       ├── Fusion Finance Ltd_02-10-2025 17_25_49.pdf
+│       ├── Godrej Properties Ltd_06-10-2025 21_33_12.pdf
+│       ├── Gravity India Ltd_02-10-2025 00_12_59.pdf
+│       ├── HDFC Bank Ltd_04-10-2025 09_34_18.pdf
+│       ├── HDFCBANK_23-09-2025 16_37_04.pdf
+│       ├── HDFCLIFE_19-09-2025 11_22_59.pdf
+│       ├── ITC Ltd_26-09-2025 18_40_44.pdf
+│       ├── IZMO_16-09-2025 09_05_35.pdf
+│       ├── Indusind Bank Ltd_06-10-2025 19_17_08.pdf
+│       ├── Infosys Ltd_03-10-2025 15_32_35.pdf
+│       ├── Infosys Ltd_30-09-2025 20_07_32.pdf
+│       ├── Jubilant Pharmova Ltd_04-10-2025 23_56_23.pdf
+│       ├── Kernex Microsystems India Ltd_27-09-2025 01_42_06.pdf
+│       ├── Kirloskar Ferrous Industries Ltd_26-09-2025 23_12_54.pdf
+│       ├── Lemon Tree Hotels Ltd_26-09-2025 21_56_55.pdf
+│       ├── MPS Ltd_11-10-2025 00_57_09.pdf
+│       ├── MUTHOOT FINANCE Ltd_06-10-2025 09_54_22.pdf
+│       ├── Mahanagar Gas Ltd_06-10-2025 20_52_57.pdf
+│       ├── Mahindra & Mahindra Ltd_01-10-2025 10_13_52.pdf
+│       ├── Mahindra & Mahindra Ltd_09-10-2025 19_55_35.pdf
+│       ├── Maruti Suzuki India Ltd_01-10-2025 16_16_41.pdf
+│       ├── Mihika Industries Ltd_02-10-2025 00_15_50.pdf
+│       ├── Mrugesh Trading Ltd_01-10-2025 23_48_26.pdf
+│       ├── New Delhi Television Ltd_01-10-2025 23_25_18.pdf
+│       ├── Omnipotent Industries Ltd_06-10-2025 22_05_37.pdf
+│       ├── One 97 Communications Ltd_01-10-2025 20_28_12.pdf
+│       ├── Orient Bell Ltd_01-10-2025 16_02_15.pdf
+│       ├── PB Fintech Ltd_09-10-2025 23_15_43.pdf
+│       ├── PCS Technology Ltd_26-09-2025 22_57_29.pdf
+│       ├── PNB Housing Finance Ltd_06-10-2025 18_53_51.pdf
+│       ├── Padmalaya Telefilms Ltd_01-10-2025 23_43_15.pdf
+│       ├── Padmalaya Telefilms Ltd_02-10-2025 00_05_22.pdf
+│       ├── Panyam Cements & Mineral Industries Ltd_06-10-2025 21_00_53 (1).pdf
+│       ├── Patel Retail Ltd_03-10-2025 07_11_33.pdf
+│       ├── Perfect-Octave Media Projects Ltd_27-09-2025 02_01_29.pdf
+│       ├── Persistent Systems Ltd_06-10-2025 21_05_57.pdf
+│       ├── Power Grid Corporation of India Ltd_26-09-2025 21_57_09.pdf
+│       ├── Precision Wires India Ltd_05-10-2025 12_05_22.pdf
+│       ├── Prestige Estates Projects Ltd_06-10-2025 21_47_16.pdf
+│       ├── RDB Infrastructure And Power Ltd_01-10-2025 23_41_52.pdf
+│       ├── RELIANCE_23-09-2025 19_27_08.pdf
+│       ├── Reliance Industries Ltd_09-10-2025 19_09_49.pdf
+│       ├── Sammaan Capital Ltd_02-10-2025 22_10_46.pdf
+│       ├── Schloss Bangalore Ltd_09-10-2025 23_16_23.pdf
+│       ├── Simplex Castings Ltd_02-10-2025 20_35_23.pdf
+│       ├── Suraj Industries Ltd_06-10-2025 21_16_46.pdf
+│       ├── Syrma SGS Technology Ltd_27-09-2025 00_03_43.pdf
+│       ├── TCS_25-09-2025 19_19_31.pdf
+│       ├── Tamilnadu Telecommunications Ltd_27-09-2025 02_05_15.pdf
+│       ├── Tata Consultancy Services Ltd_09-10-2025 21_24_04.pdf
+│       ├── Tips Music Ltd_07-10-2025 11_33_05.pdf
+│       ├── Triton Valves Ltd_26-09-2025 22_32_36.pdf
+│       ├── Utkarsh Small Finance Bank Ltd_05-10-2025 19_04_16.pdf
+│       ├── Vikram Solar Ltd_26-09-2025 21_05_53.pdf
+│       ├── Virat Crane Industries Ltd_01-10-2025 16_13_15.pdf
+│       ├── Vishal Mega Mart Ltd_01-10-2025 16_15_57.pdf
+│       ├── Vivanza Biosciences Ltd_05-10-2025 13_20_41.pdf
+│       ├── Waaree Renewable Technologies Ltd_05-10-2025 13_10_12.pdf
+│       ├── Yes Bank Ltd_08-10-2025 00_13_52.pdf
+│       ├── Yes Bank_20-09-2025 22_46_38.pdf
+│       ├── processed
+│       │   ├── .DS_Store
+│       │   ├── 2025-09-16
+│       │   │   └── .DS_Store
+│       │   ├── 2025-09-19
+│       │   │   └── .DS_Store
+│       │   ├── 2025-09-20
+│       │   │   └── .DS_Store
+│       │   ├── 2025-09-23
+│       │   │   └── .DS_Store
+│       │   ├── 2025-09-25
+│       │   │   └── .DS_Store
+│       │   ├── 2025-09-26
+│       │   │   └── .DS_Store
+│       │   ├── 2025-09-27
+│       │   │   └── .DS_Store
+│       │   ├── 2025-09-29
+│       │   │   └── .DS_Store
+│       │   ├── 2025-09-30
+│       │   │   └── .DS_Store
+│       │   ├── 2025-10-01
+│       │   │   └── .DS_Store
+│       │   ├── 2025-10-02
+│       │   │   └── .DS_Store
+│       │   ├── 2025-10-03
+│       │   │   └── .DS_Store
+│       │   ├── 2025-10-04
+│       │   │   └── .DS_Store
+│       │   ├── 2025-10-05
+│       │   │   └── .DS_Store
+│       │   ├── 2025-10-06
+│       │   │   └── .DS_Store
+│       │   ├── 2025-10-07
+│       │   │   └── .DS_Store
+│       │   ├── 2025-10-08
+│       │   │   └── .DS_Store
+│       │   ├── 2025-10-09
+│       │   │   └── .DS_Store
+│       │   └── 2025-10-11
+│       │       └── .DS_Store
+│       └── yashpakka_02102025151441_2509_Scrutinizer_Report_and_Voting_Results.pdf
+├── main.py
+├── requirements.txt
+├── routers
+│   ├── announcements.py
+│   ├── health.py
+│   └── raw_announcements.py
+├── schemas
+│   └── schema.py
+├── scripts
+│   ├── start_pdf_watcher.sh
+│   └── update_market_snapshots.py
+├── services
+│   ├── __init__.py
+│   ├── csv_processor.py
+│   ├── csv_utils.py
+│   ├── filename_utils.py
+│   ├── image_processor.py
+│   ├── image_utils.py
+│   ├── index_builder.py
+│   ├── llm_utils.py
+│   ├── pdf_processor.py
+│   ├── pdf_watcher.py
+│   ├── sentiment_utils.py
+│   └── update_logo_and_patch_json.py
+└── tools
+    ├── .DS_Store
+    ├── latest_marketdata_json.py
+    ├── regen_announcement.py
+    └── validate_master.py
+
+42 directories, 182 files

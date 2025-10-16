@@ -1,0 +1,638 @@
+#!/usr/bin/env python3
+"""
+services/pdf_processor.py
+
+Refactored, robust PDF -> announcement master JSON processor.
+
+Responsibilities:
+ - Use filename_utils.filename_to_symbol() to resolve canonical symbol/company_name.
+ - Extract announcement datetime from filename (via filename_utils).
+ - Extract text from PDF using pypdf (if available).
+ - Enrich using csv_utils.get_market_snapshot and csv_utils.get_indices_for_symbol.
+ - Get images via image_utils.get_logo_path/get_banner_path.
+ - Call llm_utils for headline and summary and sentiment_utils for blended sentiment.
+ - Write master JSON atomically and move processed PDF into date-based folder.
+ - Maintain processing_events for debugging/audit.
+
+This module expects the following service modules to exist:
+ - services.csv_utils
+ - services.filename_utils
+ - services.index_builder
+ - services.image_utils
+ - services.llm_utils
+ - services.sentiment_utils
+"""
+
+from __future__ import annotations
+import os
+import sys
+import json
+import hashlib
+import shutil
+import argparse
+import traceback
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Dict, Any, List
+
+# Attempt to import local services (fall back to top-level imports if run differently)
+try:
+    from services import csv_utils, filename_utils, image_utils, llm_utils, sentiment_utils, index_builder  # type: ignore
+except Exception:
+    try:
+        import csv_utils, filename_utils, image_utils, llm_utils, sentiment_utils, index_builder  # type: ignore
+    except Exception as e:
+        print("Failed to import service modules. Ensure you run from project root with proper PYTHONPATH.", file=sys.stderr)
+        raise
+
+# Optional PDF reader
+try:
+    from pypdf import PdfReader
+except Exception:
+    PdfReader = None
+
+import re
+
+# IST timezone (naive with tzinfo)
+IST = timezone(timedelta(hours=5, minutes=30))
+
+VERSION = "pdf_processor_v1.4"
+
+# Directories (relative to backend/)
+BASE = Path(__file__).resolve().parents[1]
+INCOMING_PDF_DIR = BASE / "input_data" / "pdf"
+PROCESSED_JSON_BASE = BASE / "data" / "announcements"
+PROCESSED_PDF_BASE = BASE / "input_data" / "pdf" / "processed"
+ERROR_DIR = BASE / "error_reports"
+
+for d in (PROCESSED_JSON_BASE, PROCESSED_PDF_BASE, ERROR_DIR):
+    d.mkdir(parents=True, exist_ok=True)
+
+
+# ----------------- Helpers -----------------
+def now_iso() -> str:
+    """Current time in IST as ISO string with tzinfo."""
+    return datetime.now(IST).isoformat()
+
+
+def compute_sha1(path: Path) -> str:
+    h = hashlib.sha1()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def make_json_safe(obj):
+    """
+    Convert common non-JSON-friendly types (pathlib, numpy, pandas.Timestamp, etc)
+    into JSON-serializable types.
+    """
+    try:
+        import numpy as _np  # type: ignore
+        import pandas as _pd  # type: ignore
+    except Exception:
+        _np = None
+        _pd = None
+
+    from pathlib import Path as _Path
+
+    if obj is None or isinstance(obj, (str, bool, int, float)):
+        return obj
+    if _np is not None:
+        if isinstance(obj, (_np.integer,)):
+            return int(obj)
+        if isinstance(obj, (_np.floating,)):
+            return float(obj)
+    if _pd is not None:
+        try:
+            if isinstance(obj, _pd.Timestamp):
+                return obj.isoformat()
+            if _pd.isna(obj):
+                return None
+        except Exception:
+            pass
+    if isinstance(obj, _Path):
+        return str(obj)
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            try:
+                out[str(k)] = make_json_safe(v)
+            except Exception:
+                out[str(k)] = str(v)
+        return out
+    if isinstance(obj, (list, tuple, set)):
+        return [make_json_safe(x) for x in obj]
+    try:
+        return json.loads(json.dumps(obj))
+    except Exception:
+        return str(obj)
+
+
+def safe_float(x, default=None):
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+# ----------------- PDF extraction -----------------
+def extract_text_from_pdf(pdf_path: Path, max_pages: Optional[int] = 200) -> str:
+    """Extract text using pypdf; returns empty string if not available or error."""
+    if PdfReader is None:
+        return ""
+    try:
+        parts: List[str] = []
+        with pdf_path.open("rb") as fh:
+            reader = PdfReader(fh)
+            for i, p in enumerate(reader.pages):
+                if max_pages and i >= max_pages:
+                    break
+                try:
+                    txt = p.extract_text() or ""
+                except Exception:
+                    txt = ""
+                if txt:
+                    parts.append(txt)
+        return "\n".join(parts)
+    except Exception:
+        return ""
+
+
+# ----------------- Announcement datetime extraction -----------------
+# Prefer filename_utils.extract_datetime_from_filename if present; otherwise fallback to local robust parser
+def _extract_datetime_from_filename_local(filename: str) -> Optional[Dict[str, str]]:
+    """
+    Local fallback datetime extractor (returns {"iso":..., "human":...} or None).
+    Accepts patterns like:
+     - DD-MM-YYYY HH_mm_ss or DD-MM-YYYY HH:mm:ss
+     - YYYY-MM-DD or YYYYMMDD
+     - DD-MM-YYYY
+    """
+    if not filename:
+        return None
+    name = Path(filename).name
+    # Try DD-MM-YYYY HH_mm_ss
+    m = re.search(r'(?P<d>\d{2}-\d{2}-\d{4})[ _-]+(?P<h>\d{2})[:_](?P<m>\d{2})[:_](?P<s>\d{2})', name)
+    if m:
+        try:
+            dt = datetime.strptime(f"{m.group('d')} {m.group('h')}:{m.group('m')}:{m.group('s')}", "%d-%m-%Y %H:%M:%S")
+            dt = dt.replace(tzinfo=IST)
+            return {"iso": dt.isoformat(), "human": dt.strftime("%d-%b-%Y, %H:%M:%S")}
+        except Exception:
+            pass
+    # Try YYYY-MM-DD or YYYYMMDD
+    m2 = re.search(r'(?P<Y>\d{4})[-_]?((?P<M>\d{2})[-_]?((?P<D>\d{2})))', name)
+    if m2:
+        try:
+            Y = int(m2.group("Y")); M = int(m2.group("M")); D = int(m2.group("D"))
+            dt = datetime(Y, M, D, 0, 0, 0, tzinfo=IST)
+            return {"iso": dt.isoformat(), "human": dt.strftime("%d-%b-%Y, %H:%M:%S")}
+        except Exception:
+            pass
+    # Try DD-MM-YYYY only
+    m3 = re.search(r'(?P<d2>\d{2}-\d{2}-\d{4})', name)
+    if m3:
+        try:
+            dt = datetime.strptime(m3.group('d2'), "%d-%m-%Y").replace(tzinfo=IST)
+            return {"iso": dt.isoformat(), "human": dt.strftime("%d-%b-%Y, %H:%M:%S")}
+        except Exception:
+            pass
+    return None
+
+
+def extract_datetime_from_filename(filename: str) -> Optional[Dict[str, str]]:
+    """Wrapper which uses filename_utils.extract_datetime_from_filename if available."""
+    try:
+        if hasattr(filename_utils, "extract_datetime_from_filename"):
+            dt = filename_utils.extract_datetime_from_filename(filename)
+            if isinstance(dt, tuple) and len(dt) == 2:
+                iso, human = dt
+                if iso or human:
+                    return {"iso": iso, "human": human}
+            if isinstance(dt, dict):
+                return dt
+        # fallback
+        return _extract_datetime_from_filename_local(filename)
+    except Exception:
+        return _extract_datetime_from_filename_local(filename)
+
+
+# ----------------- Market snapshot & images -----------------
+def enrich_with_market_and_indices(symbol: str) -> Optional[Dict[str, Any]]:
+    """Return a normalized market snapshot (JSON-ready) or None."""
+    if not symbol:
+        return None
+    snap = csv_utils.get_market_snapshot(symbol) or {}
+    # canonical keys
+    keys = [
+        "symbol", "company_name", "rank", "price", "change_1d_pct", "change_1w_pct", "vwap", "mcap_rs_cr",
+        "volume_24h_rs_cr", "all_time_high", "atr_pct", "relative_vol", "vol_change_pct", "volatility",
+        "market_snapshot_date", "logo_url", "banner_url"
+    ]
+    normalized = {k: snap.get(k) if snap.get(k) is not None else None for k in keys}
+
+    # numeric conversions
+    for k in ("price", "vwap", "mcap_rs_cr", "volume_24h_rs_cr", "all_time_high", "atr_pct", "relative_vol", "vol_change_pct", "volatility", "rank"):
+        v = normalized.get(k)
+        if v is not None:
+            try:
+                if k == "rank":
+                    normalized[k] = int(v)
+                else:
+                    normalized[k] = float(v)
+            except Exception:
+                normalized[k] = v
+
+    # attach indices
+    try:
+        broad, sector = csv_utils.get_indices_for_symbol(symbol)
+    except Exception:
+        broad, sector = ("Uncategorised Index", "Uncategorised Sector")
+    normalized["broad_index"] = broad
+    normalized["sector_index"] = sector
+
+    # attach images (best-effort)
+    try:
+        # image_utils.get_logo_path may return (path, public_url) or simple path
+        lp, lu = image_utils.get_logo_path(symbol, normalized.get("company_name") or "")
+        bp, bu = image_utils.get_banner_path(symbol, normalized.get("company_name") or "")
+        normalized["logo_url"] = [str(lp), lu] if lp is not None else None
+        normalized["banner_url"] = [str(bp), bu] if bp is not None else None
+    except Exception:
+        # keep whatever came from csv_utils or None
+        pass
+
+    return make_json_safe(normalized)
+
+
+# ----------------- Filename matching -----------------
+def match_filename(filename: str) -> Dict[str, Any]:
+    """
+    Use filename_utils.filename_to_symbol() to determine canonical symbol/company.
+    Returns an event-like dict with keys: found, symbol, company_name, score, match_type, candidates.
+    """
+    ev = {"found": False, "symbol": None, "company_name": None, "score": 0.0, "match_type": "no_match", "candidates": []}
+    try:
+        # Prefer calling filename_utils.filename_to_symbol which uses index_builder internally
+        if hasattr(filename_utils, "filename_to_symbol"):
+            # pass csv_path if csv_utils has loaded path
+            csv_path = None
+            try:
+                csv_path = str(csv_utils._EOD_PATH) if getattr(csv_utils, "_EOD_PATH", None) else None
+            except Exception:
+                csv_path = None
+            res = filename_utils.filename_to_symbol(filename, csv_path=csv_path)
+            if isinstance(res, dict) and res.get("found"):
+                ev.update({
+                    "found": True,
+                    "symbol": res.get("symbol"),
+                    "company_name": res.get("company_name"),
+                    "score": res.get("score", 0.0),
+                    "match_type": res.get("match_type"),
+                    "candidates": res.get("candidates", []) or []
+                })
+                return ev
+    except Exception:
+        # Log a traceback to events later; fall through to index_builder/csv fallbacks
+        pass
+
+    # Last-resort: try index_builder direct APIs (if available)
+    try:
+        # base tokenization: remove extension and collapse punctuation to spaces
+        base_no_ext = re.sub(r'[\-_.]+', ' ', Path(filename).name.rsplit(".", 1)[0]).strip()
+        tokens = [t for t in re.split(r'\s+', base_no_ext) if t and not t.isdigit() and len(t) >= 2]
+
+        # exact match tokens
+        for t in tokens:
+            sym = index_builder.get_symbol_by_exact(t)
+            if sym:
+                row = index_builder.get_company_by_symbol(sym)
+                ev.update({"found": True, "symbol": sym, "company_name": row.get("company_name") if row else None, "score": 1.0, "match_type": "exact"})
+                return ev
+
+        # token lookup
+        for t in tokens:
+            sym = index_builder.get_symbol_by_token(t)
+            if sym:
+                row = index_builder.get_company_by_symbol(sym)
+                ev.update({"found": True, "symbol": sym, "company_name": row.get("company_name") if row else None, "score": 0.85, "match_type": "token"})
+                return ev
+
+        # token overlap
+        overlap = index_builder.token_overlap_search(tokens, min_score=0.55)
+        if overlap:
+            sym, score = overlap
+            row = index_builder.get_company_by_symbol(sym)
+            ev.update({"found": True, "symbol": sym, "company_name": row.get("company_name") if row else None, "score": float(score), "match_type": "token_overlap"})
+            return ev
+
+        # fuzzy
+        fuzzy = index_builder.fuzzy_lookup_symbol(base_no_ext)
+        if fuzzy:
+            row = index_builder.get_company_by_symbol(fuzzy)
+            ev.update({"found": True, "symbol": fuzzy, "company_name": row.get("company_name") if row else None, "score": 0.7, "match_type": "fuzzy"})
+            return ev
+    except Exception:
+        pass
+
+    # Final fallback: CSV full-scan via filename_utils.filename_to_symbol (if that function isn't present earlier),
+    # or worst-case return not found.
+    try:
+        if hasattr(filename_utils, "filename_to_symbol"):
+            res = filename_utils.filename_to_symbol(filename)
+            if isinstance(res, dict) and res.get("found"):
+                ev.update({"found": True, "symbol": res.get("symbol"), "company_name": res.get("company_name"), "score": res.get("score", 0.0), "match_type": res.get("match_type"), "candidates": res.get("candidates", [])})
+                return ev
+    except Exception:
+        pass
+
+    return ev
+
+
+# ----------------- Core processing -----------------
+def write_master_json(out_path: Path, data: Dict[str, Any]):
+    """Write JSON atomically (tmp -> rename)."""
+    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(make_json_safe(data), fh, ensure_ascii=False, indent=2)
+    os.replace(str(tmp), str(out_path))
+
+
+def _validate_headline(h: Optional[str]) -> bool:
+    """Simple heuristic whether a headline looks plausible (kept small)."""
+    if not h or not isinstance(h, str):
+        return False
+    h = h.strip()
+    parts = h.split()
+    if len(parts) < 3 or len(parts) > 40:
+        return False
+    if not h.endswith((".", "!", "?")):
+        return False
+    # require at least one typical corporate verb
+    verbs = {"appoint", "approve", "announce", "sign", "acquire", "launch", "enter", "issue", "complete", "report", "declare", "receive", "award", "submit", "file", "receives", "confirms"}
+    return any(v in h.lower() for v in verbs)
+
+
+def deterministic_headline_from_summary(summary: Optional[str]) -> Optional[str]:
+    if not summary:
+        return None
+    s = summary.strip().replace("\n", " ")
+    parts = s.split()
+    head = " ".join(parts[:14])
+    if head and head[-1] not in ".!?":
+        head = head.strip() + "."
+    return head
+
+
+def process_pdf(pdf_path: Path, dry_run: bool = False, force: bool = False) -> Dict[str, Any]:
+    """
+    Process a single PDF into the master JSON dict and move the PDF (unless dry_run).
+    Returns the master dict.
+    """
+    evts: List[Dict[str, Any]] = []
+    evts.append({"event": "start", "ts": now_iso(), "file": str(pdf_path)})
+
+    try:
+        sha1 = compute_sha1(pdf_path)
+        evts.append({"event": "sha1_computed", "ts": now_iso(), "sha1": sha1})
+
+        # 1) Filename -> symbol
+        match = match_filename(pdf_path.name)
+        evts.append({"event": "filename_matched", "ts": now_iso(), "match": match})
+
+        canonical_symbol = match.get("symbol")
+        canonical_company_name = match.get("company_name")
+
+        # 2) Announcement datetime (prefer filename_utils)
+        dt_info = None
+        try:
+            # some filename_utils implementations return tuple (iso, human)
+            if hasattr(filename_utils, "extract_datetime_from_filename"):
+                dt_res = filename_utils.extract_datetime_from_filename(pdf_path.name)
+                if isinstance(dt_res, tuple) and len(dt_res) == 2:
+                    iso, human = dt_res
+                    dt_info = {"iso": iso, "human": human} if (iso or human) else None
+                elif isinstance(dt_res, dict):
+                    dt_info = dt_res
+        except Exception:
+            dt_info = None
+        if not dt_info:
+            dt_info = extract_datetime_from_filename(pdf_path.name) or {}
+
+        announcement_iso = dt_info.get("iso")
+        announcement_human = dt_info.get("human")
+
+        # 3) Extract text from PDF
+        body_text = extract_text_from_pdf(pdf_path) if PdfReader else ""
+        evts.append({"event": "text_extracted", "ts": now_iso(), "chars": len(body_text)})
+
+        # 4) Enrichment
+        market_snapshot = enrich_with_market_and_indices(canonical_symbol) if canonical_symbol else None
+        evts.append({"event": "enrichment_done", "ts": now_iso(), "market_snapshot_found": bool(market_snapshot)})
+
+        # 5) Images (logo/banner)
+        company_logo = None
+        banner_image = None
+        if canonical_symbol:
+            try:
+                logo_path, logo_pub = image_utils.get_logo_path(canonical_symbol, canonical_company_name or "")
+                banner_path, banner_pub = image_utils.get_banner_path(canonical_symbol, canonical_company_name or "")
+                company_logo = str(logo_path) if logo_path is not None else None
+                banner_image = str(banner_path) if banner_path is not None else None
+            except Exception:
+                company_logo = None
+                banner_image = None
+
+        # 6) LLM headline + summary
+        llm_meta = {"used": False}
+        headline_ai = None
+        headline_final = None
+        summary_60 = None
+        headline_raw = None
+
+        try:
+            hs = llm_utils.classify_headline_and_summary(body_text)
+            llm_meta = hs.get("llm_meta", {"ok": False})
+            headline_ai = hs.get("headline_ai") or hs.get("headline_final") or None
+            summary_60 = hs.get("summary_60") or None
+            headline_raw = hs.get("headline_raw") or None
+            evts.append({"event": "llm_done", "ts": now_iso(), "meta": {"ok": llm_meta.get("ok"), "model": llm_meta.get("model")}})
+        except Exception as e:
+            evts.append({"event": "llm_error", "ts": now_iso(), "error": str(e)})
+
+        # Prefer LLM headline if valid; else fallback to deterministic headline from summary
+        if headline_ai and isinstance(headline_ai, str):
+            headline_final = headline_ai.strip()
+            # sanitize obvious bad trailing preposition periods
+            if re.search(r'\b(of|for|including|regarding|with|to|on|in)\.$', headline_final.strip().lower()):
+                parts = headline_final.rstrip('.').split()
+                if len(parts) > 3:
+                    headline_final = " ".join(parts[:-1]).rstrip() + "."
+        else:
+            if not summary_60 and headline_ai is None:
+                # single retry
+                try:
+                    hs2 = llm_utils.classify_headline_and_summary(body_text)
+                    headline_ai = headline_ai or hs2.get("headline_ai") or hs2.get("headline_final")
+                    summary_60 = summary_60 or hs2.get("summary_60")
+                    evts.append({"event": "llm_retry", "ts": now_iso()})
+                except Exception:
+                    pass
+            if headline_ai:
+                headline_final = str(headline_ai).strip()
+            elif summary_60:
+                headline_final = deterministic_headline_from_summary(summary_60)
+            else:
+                headline_final = None
+
+        evts.append({"event": "headline_finalized", "ts": now_iso(), "path": "llm_valid" if headline_final else "fallback", "headline_final": headline_final})
+
+        # 7) Sentiment
+        llm_sent_raw = None
+        try:
+            sent_raw = llm_utils.classify_sentiment(body_text)
+            llm_sent_raw = {"label": sent_raw.get("label"), "score": safe_float(sent_raw.get("score"), None)}
+        except Exception:
+            llm_sent_raw = None
+
+        sent = sentiment_utils.compute_sentiment(body_text or "", llm_raw=llm_sent_raw)
+        evts.append({"event": "sentiment_computed", "ts": now_iso(), "badge": {"label": sent.get("label"), "score": sent.get("score")}})
+
+        # 8) Build master dict
+        created_at = now_iso()
+        # build file id: ann_<ISO-without-colons>_<sha1prefix>
+        iso_for_id = announcement_iso if announcement_iso else datetime.now(IST).isoformat()
+        safe_iso = iso_for_id.replace(":", "").replace("-", "").split("+")[0]
+        file_id = f"ann_{safe_iso}_{sha1[:16]}"
+
+        master = {
+            "id": file_id,
+            "sha1": sha1,
+            "canonical_symbol": canonical_symbol,
+            "canonical_company_name": canonical_company_name,
+            "symbol": canonical_symbol or (market_snapshot.get("symbol") if market_snapshot else None),
+            "company_name": canonical_company_name or (market_snapshot.get("company_name") if market_snapshot else None),
+            "headline_final": headline_final,
+            "headline_raw": headline_raw,
+            "headline_ai": headline_ai,
+            "summary_60": summary_60,
+            "summary_raw": (body_text[:4000] + "...") if body_text and len(body_text) > 4000 else body_text or None,
+            "announcement_datetime_iso": announcement_iso,
+            "announcement_datetime_human": announcement_human,
+            "source_file_original": pdf_path.name,
+            "source_file_normalized": pdf_path.name,
+            "market_snapshot": market_snapshot,
+            "indices": [market_snapshot.get("broad_index") if market_snapshot else "Uncategorised Index",
+                        market_snapshot.get("sector_index") if market_snapshot else "Uncategorised Sector"],
+            "company_logo": company_logo,
+            "banner_image": banner_image,
+            "tradingview_url": f"https://www.tradingview.com/symbols/NSE-{canonical_symbol}/" if canonical_symbol else None,
+            "sentiment_badge": sent,
+            "llm_metadata": {"used": bool(llm_meta.get("ok")), "model": llm_meta.get("model") if isinstance(llm_meta, dict) else None},
+            "keywords": sent.get("raw_responses", {}).get("keyword", {}).get("matches", {}).get("positive", []),
+            "processing_events": evts,
+            "final_status": "processed",
+            "created_at": created_at,
+            "version": VERSION
+        }
+
+        # 9) Write JSON and move PDF
+        # Determine json directory by announcement date if available, else today
+        if announcement_iso:
+            try:
+                dt = datetime.fromisoformat(announcement_iso)
+                json_dir = PROCESSED_JSON_BASE / dt.strftime("%Y-%m-%d")
+            except Exception:
+                json_dir = PROCESSED_JSON_BASE / datetime.now(IST).strftime("%Y-%m-%d")
+        else:
+            json_dir = PROCESSED_JSON_BASE / datetime.now(IST).strftime("%Y-%m-%d")
+
+        json_dir.mkdir(parents=True, exist_ok=True)
+        out_file = json_dir / f"{file_id}.json"
+
+        if not dry_run:
+            write_master_json(out_file, master)
+
+            # move PDF to processed folder (date-based)
+            if announcement_iso:
+                try:
+                    dt = datetime.fromisoformat(announcement_iso)
+                    dest_dir = PROCESSED_PDF_BASE / dt.strftime("%Y-%m-%d")
+                except Exception:
+                    dest_dir = PROCESSED_PDF_BASE / datetime.now(IST).strftime("%Y-%m-%d")
+            else:
+                dest_dir = PROCESSED_PDF_BASE / datetime.now(IST).strftime("%Y-%m-%d")
+
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            new_pdf_path = dest_dir / pdf_path.name
+            try:
+                shutil.move(str(pdf_path), str(new_pdf_path))
+                evts.append({"event": "moved_pdf", "ts": now_iso(), "to": str(new_pdf_path)})
+            except Exception as e:
+                evts.append({"event": "move_failed", "ts": now_iso(), "error": str(e)})
+        else:
+            evts.append({"event": "dry_run_skipped_write", "ts": now_iso()})
+
+        return master
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        evts.append({"event": "error", "ts": now_iso(), "error": str(e), "trace": tb})
+        try:
+            err_path = ERROR_DIR / f"{pdf_path.name}.error.json"
+            with err_path.open("w", encoding="utf-8") as fh:
+                json.dump(make_json_safe({"processing_events": evts, "trace": tb}), fh, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        # re-raise so CLI or caller knows processing failed
+        raise
+
+
+# ----------------- CLI -----------------
+def _cli():
+    parser = argparse.ArgumentParser(description="pdf_processor - process pdf into master JSON")
+    parser.add_argument("--src", help="Source PDF path or glob (e.g. input_data/pdf/*.pdf)", required=True)
+    parser.add_argument("--dry-run", action="store_true", help="Do not write JSON or move PDFs")
+    parser.add_argument("--force", action="store_true", help="Force reprocessing (not implemented in detail)")
+    args = parser.parse_args()
+
+    import glob
+    src = args.src
+    paths: List[Path] = []
+    if "*" in src or "?" in src:
+        paths = [Path(p) for p in glob.glob(src)]
+    else:
+        p = Path(src)
+        if p.exists():
+            paths = [p]
+
+    if not paths:
+        print("No files matched:", src, file=sys.stderr)
+        return
+
+    # warm caches
+    try:
+        csv_utils.load_processed_df(force_reload=False)
+    except Exception:
+        pass
+    try:
+        index_builder.refresh_index()
+    except Exception:
+        pass
+
+    for p in paths:
+        try:
+            print("Processing", p)
+            master = process_pdf(p, dry_run=args.dry_run, force=args.force)
+            print("Wrote master JSON for", p.name)
+        except Exception as e:
+            print("Failed processing", p, ":", str(e), file=sys.stderr)
+
+
+if __name__ == "__main__":
+    _cli()
