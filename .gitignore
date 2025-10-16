@@ -1,0 +1,9 @@
+backend/input_data/pdf/
+backend/input_data/images/
+backend/input_data/csv/
+backend/data/
+backend/error_reports/
+backend/logs/
+*.DS_Store
+.venv/
+__pycache__/
