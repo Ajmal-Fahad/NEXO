@@ -7,3 +7,15 @@ backend/logs/
 *.DS_Store
 .venv/
 __pycache__/
+.env
+node_modules/
+.expo/
+.DS_Store
+android/
+ios/
+build/
+# Created by venv; see https://docs.python.org/3/library/venv.html
+
+# Combined ignores from frontend & backend venv
+*.pyc
+*.log
