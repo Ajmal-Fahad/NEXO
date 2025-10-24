@@ -58,13 +58,42 @@ if not logger.handlers:
     logging.basicConfig(level=logging_level)
     logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------
+# Configuration via Pydantic Settings (optional but consistent with main.py)
+# ---------------------------------------------------------------------
+try:
+    from pydantic_settings import BaseSettings
+except ImportError:
+    BaseSettings = object  # fallback dummy class if dependency missing
+
+class CSVSettings(BaseSettings):
+    """Config schema for csv_processor; aligns with main.py Settings."""
+    S3_RAW_CSV_PATH: str | None = None
+    S3_PROCESSED_CSV_PATH: str | None = None
+    S3_STORAGE_OPTIONS: str | None = None
+    S3_OP_TIMEOUT: int = 30
+    S3_RETRIES: int = 2
+    S3_RETRY_BACKOFF: float = 1.0
+    LOG_LEVEL: str = "INFO"
+
+    class Config:
+        env_file = None  # Do not auto-load .env (same philosophy as main.py)
+        case_sensitive = False
+
+# Instantiate for runtime use (but still allow os.getenv() fallback logic)
+csv_settings = CSVSettings()
+if csv_settings.LOG_LEVEL:
+    logger.setLevel(getattr(logging, csv_settings.LOG_LEVEL.upper(), logging.INFO))
+
+logger.debug("CSVSettings loaded: %s", csv_settings.model_dump() if hasattr(csv_settings, "model_dump") else vars(csv_settings))
+
 # Paths & env configuration
 BASE = Path(__file__).resolve().parents[1]
 LOCAL_RAW_DIR = BASE / "input_data" / "csv" / "eod_csv"
 LOCAL_PROCESSED_DIR = BASE / "input_data" / "csv" / "processed_csv"
 
-S3_RAW_CSV_PATH = os.getenv("S3_RAW_CSV_PATH", "").strip() or None
-S3_PROCESSED_CSV_PATH = os.getenv("S3_PROCESSED_CSV_PATH", "").strip() or None
+S3_RAW_CSV_PATH = (csv_settings.S3_RAW_CSV_PATH or "").strip() or None
+S3_PROCESSED_CSV_PATH = (csv_settings.S3_PROCESSED_CSV_PATH or "").strip() or None
 
 # Validate S3 URI format early (warn only)
 if S3_RAW_CSV_PATH and not S3_RAW_CSV_PATH.startswith("s3://"):
@@ -73,7 +102,7 @@ if S3_PROCESSED_CSV_PATH and not S3_PROCESSED_CSV_PATH.startswith("s3://"):
     logger.warning("S3_PROCESSED_CSV_PATH '%s' does not start with 's3://' — this may disable S3 writes", S3_PROCESSED_CSV_PATH)
 
 # Optional JSON-encoded storage options (credentials, client_kwargs, anon, etc.)
-_S3_STORAGE_OPTIONS_RAW = os.getenv("S3_STORAGE_OPTIONS", "").strip()
+_S3_STORAGE_OPTIONS_RAW = (csv_settings.S3_STORAGE_OPTIONS or "").strip() if isinstance(csv_settings.S3_STORAGE_OPTIONS, str) else ""
 try:
     S3_STORAGE_OPTIONS: Dict[str, Any] = json.loads(_S3_STORAGE_OPTIONS_RAW) if _S3_STORAGE_OPTIONS_RAW else {}
 except Exception:
@@ -81,9 +110,9 @@ except Exception:
     logger.warning("Failed to parse S3_STORAGE_OPTIONS JSON; continuing without storage options")
 
 # Timeouts & retries for S3 operations
-S3_OP_TIMEOUT = int(os.getenv("S3_OP_TIMEOUT", "30"))
-S3_RETRIES = int(os.getenv("S3_RETRIES", "2"))
-S3_RETRY_BACKOFF = float(os.getenv("S3_RETRY_BACKOFF", "1.0"))
+S3_OP_TIMEOUT = int(csv_settings.S3_OP_TIMEOUT)
+S3_RETRIES = int(csv_settings.S3_RETRIES)
+S3_RETRY_BACKOFF = float(csv_settings.S3_RETRY_BACKOFF)
 
 # Derived effective dirs (S3 URIs kept as strings; local as Path)
 RAW_CSV_DIR = S3_RAW_CSV_PATH or str(LOCAL_RAW_DIR)
@@ -92,11 +121,39 @@ PROCESSED_DIR = S3_PROCESSED_CSV_PATH or str(LOCAL_PROCESSED_DIR)
 # Small metric: count of fallback events from S3 -> local writes
 _fallback_count = 0
 
+# optional metrics collector hook (used in tests or monitoring)
+_METRICS_COLLECTOR: Optional[Any] = None
+_METRICS_LOCK = __import__("threading").Lock()
+
+
+def reset_metrics() -> None:
+    """Reset metrics for deterministic test behavior."""
+    global _fallback_count, _METRICS_COLLECTOR
+    with _METRICS_LOCK:
+        _fallback_count = 0
+        _METRICS_COLLECTOR = None
+
+
+def set_metrics_collector(collector: Optional[Any]) -> None:
+    """
+    Install an external metrics collector (callable) for test or production metrics integration.
+    Example: set_metrics_collector(lambda name, val: print(f"{name}={val}"))
+    """
+    global _METRICS_COLLECTOR
+    _METRICS_COLLECTOR = collector
+
 def _increment_fallback_metric() -> None:
-    """Increment the in-process fallback counter and log the event."""
-    global _fallback_count
-    _fallback_count += 1
-    logger.info("Fallback to local storage occurred (total=%d)", _fallback_count)
+    """Increment fallback counter and emit metric if collector is attached."""
+    global _fallback_count, _METRICS_COLLECTOR
+    with _METRICS_LOCK:
+        _fallback_count += 1
+        current = _fallback_count
+    logger.info("Fallback to local storage occurred (total=%d)", current)
+    if _METRICS_COLLECTOR:
+        try:
+            _METRICS_COLLECTOR("csv_processor.fallback_to_local", current)
+        except Exception:
+            logger.debug("Metrics collector failed; continuing")
 
 # Helpers: concurrency, retry, timeouts
 def _is_s3_uri(path: str | Path) -> bool:
@@ -119,10 +176,11 @@ def _run_with_timeout(fn, *args, timeout: int = 30, **kwargs):
                 # best-effort; cannot kill C-level blocking calls
                 pass
 
-def _retry_call(fn, args, retries: int = 2, backoff: float = 1.0, **kwargs):
+async def _retry_call(fn, args: tuple, retries: int = 2, backoff: float = 1.0, **kwargs) -> Any:
     """
-    Simple retry wrapper. Retries on any Exception, waiting backoff*attempt between retries.
-    Returns the first successful result or raises the last exception.
+    Async-compatible retry wrapper. Uses asyncio.sleep() instead of blocking time.sleep().
+    Returns first successful result or raises the last exception.
+    Note: `args` should be a tuple of positional arguments passed to the callable.
     """
     last_exc = None
     for attempt in range(1, retries + 1):
@@ -132,12 +190,12 @@ def _retry_call(fn, args, retries: int = 2, backoff: float = 1.0, **kwargs):
             last_exc = exc
             logger.warning("Attempt %d/%d failed for %s: %s", attempt, retries, getattr(fn, "__name__", "call"), exc)
             if attempt < retries:
-                time.sleep(backoff * attempt)
+                await asyncio.sleep(backoff * attempt)
     logger.exception("All %d attempts failed for %s", retries, getattr(fn, "__name__", "call"))
     raise last_exc
 
 # S3 helpers
-def _list_s3_csvs(s3_prefix: str) -> List[str]:
+async def _list_s3_csvs(s3_prefix: str) -> List[str]:
     """
     List CSV files under an S3 prefix using fsspec. Returns a sorted list of s3:// URIs (or empty list).
     This function applies retry + timeout wrappers.
@@ -157,7 +215,7 @@ def _list_s3_csvs(s3_prefix: str) -> List[str]:
                     out.append(f"s3://{s}")
             return sorted(out)
 
-        return _retry_call(lambda p: _run_with_timeout(_inner, p, timeout=S3_OP_TIMEOUT),
+        return await _retry_call(lambda p: _run_with_timeout(_inner, p, timeout=S3_OP_TIMEOUT),
                            (s3_prefix,), retries=S3_RETRIES, backoff=S3_RETRY_BACKOFF)
     except FuturesTimeout:
         logger.warning("S3 list operation timed out after %s seconds for prefix %s", S3_OP_TIMEOUT, s3_prefix)
@@ -166,7 +224,7 @@ def _list_s3_csvs(s3_prefix: str) -> List[str]:
         logger.exception("Error listing S3 CSVs for %s: %s", s3_prefix, exc)
         return []
 
-def _write_s3_csv(output_path: str, df: pd.DataFrame) -> None:
+async def _write_s3_csv(output_path: str, df: pd.DataFrame) -> None:
     """
     Write DataFrame to S3 using fsspec. Uses retry + timeout wrappers.
     Raises exceptions on failure.
@@ -178,7 +236,7 @@ def _write_s3_csv(output_path: str, df: pd.DataFrame) -> None:
         with fs.open(path, "w") as f:
             _df.to_csv(f, index=False, encoding="utf-8")
     # apply retry + timeout
-    return _retry_call(lambda p, d: _run_with_timeout(_inner, p, d, timeout=S3_OP_TIMEOUT),
+    return await _retry_call(lambda p, d: _run_with_timeout(_inner, p, d, timeout=S3_OP_TIMEOUT),
                        (output_path, df), retries=S3_RETRIES, backoff=S3_RETRY_BACKOFF)
 
 def _read_csv(src: str) -> pd.DataFrame:
@@ -202,7 +260,7 @@ def _read_csv(src: str) -> pd.DataFrame:
         return pd.read_csv(src, dtype=str, keep_default_na=False)
 
 # Discovery: find latest CSV (S3-first then local)
-def find_latest_csv() -> Optional[str]:
+async def find_latest_csv() -> Optional[str]:
     """
     Auto-detect the latest CSV to process.
     - Tries S3 first (if RAW_CSV_DIR is an s3:// prefix and fsspec available).
@@ -211,7 +269,7 @@ def find_latest_csv() -> Optional[str]:
     """
     # S3-first
     if _is_s3_uri(RAW_CSV_DIR):
-        s3_candidates = _list_s3_csvs(RAW_CSV_DIR)
+        s3_candidates = await _list_s3_csvs(RAW_CSV_DIR)
         if s3_candidates:
             chosen = s3_candidates[-1]
             logger.info("Found latest CSV on S3: %s", chosen)
@@ -254,7 +312,7 @@ def _validate_columns(df: pd.DataFrame) -> None:
         raise ValueError(f"CSV missing required columns: {missing}")
 
 # Data processing (mapping + normalization)
-def process_csv(src_path: str, verbose: bool = False) -> Dict[str, Any]:
+async def process_csv(src_path: str, verbose: bool = False) -> Dict[str, Any]:
     """
     Process a CSV (local or S3) and write processed CSV to configured processed dir.
 
@@ -391,7 +449,7 @@ def process_csv(src_path: str, verbose: bool = False) -> Dict[str, Any]:
         if _is_s3_uri(output_path):
             if not fsspec:
                 raise RuntimeError("Attempted to write to S3 but fsspec is not installed")
-            _write_s3_csv(output_path, out)
+            await _write_s3_csv(output_path, out)
             logger.info("Processed CSV uploaded to S3: %s", output_path)
         else:
             out.to_csv(output_path, index=False, encoding="utf-8")
@@ -422,25 +480,24 @@ async def async_process_csv(src_path: str, verbose: bool = False) -> Dict[str, A
     Usage within FastAPI route:
     result = await async_process_csv(path)
     """
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, process_csv, src_path, verbose)
+    return await process_csv(src_path, verbose)
 
 # CLI for direct invocation
-def main():
+async def main():
     parser = argparse.ArgumentParser(description="Process latest or given EOD CSV (S3-aware).")
     parser.add_argument("--src", help="Optional path to CSV (S3 or local). If omitted, auto-detects latest.")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
-    csv_path = args.src or find_latest_csv()
+    csv_path = args.src or await find_latest_csv()
     if not csv_path:
         logger.error("No CSV source found. Exiting.")
         sys.exit(1)
 
-    result = process_csv(csv_path, verbose=args.verbose)
+    result = await process_csv(csv_path, verbose=args.verbose)
     logger.info("Processing result: %s", result)
 
-__all__ = ["find_latest_csv", "process_csv", "async_process_csv", "main"]
+__all__ = ["find_latest_csv", "process_csv", "async_process_csv", "set_metrics_collector", "reset_metrics", "main"]
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
