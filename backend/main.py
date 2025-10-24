@@ -93,18 +93,65 @@ async def _maybe_warm_index() -> None:
         logger.exception("Index warm-up failed (non-fatal): %s", exc)
 
 
+# ---------- Metrics collector setup ----------
+import threading
+_metrics_installed = False
+_metrics_lock = threading.Lock()
+
+# Try to import prometheus; be tolerant if it's absent
+try:
+    from prometheus_client import Counter, make_asgi_app
+except Exception:
+    Counter = None
+    make_asgi_app = None
+    logger.warning("prometheus_client not available; metrics features disabled")
+
+# Prometheus metrics (only if available)
+if Counter is not None:
+    _csv_fallback_counter = Counter(
+        "csv_processor_fallback_to_local_total",
+        "Count of S3→local CSV fallback events"
+    )
+else:
+    _csv_fallback_counter = None
+
+def prometheus_collector(name: str, value: int):
+    """Real Prometheus metrics integration (no-op if prometheus not available)."""
+    try:
+        if name == "csv_processor.fallback_to_local" and _csv_fallback_counter is not None:
+            _csv_fallback_counter.inc(int(value))
+    except Exception as exc:
+        logger.warning("Metrics collection failed: %s", exc)
+
+
+def setup_metrics():
+    """Thread-safe, idempotent setup for CSV metrics collector."""
+    global _metrics_installed
+    with _metrics_lock:
+        if _metrics_installed:
+            logger.debug("Metrics already setup; skipping")
+            return
+        try:
+            # Lazy import to avoid early coupling
+            from backend.services.csv_processor import set_metrics_collector
+            set_metrics_collector(prometheus_collector)
+            _metrics_installed = True
+            logger.info("Metrics collector set up for CSV processor")
+        except Exception as exc:
+            logger.warning("Metrics setup failed (non-fatal): %s", exc)
+
+
 # ---------- Lifespan (optional modern startup) ----------
 lifespan_ctx = None
 if settings.USE_MODERN_STARTUP:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # run warmup before we yield (app will not accept requests until we yield)
         await _maybe_warm_index()
+        setup_metrics()  # safe to call here during app startup
         yield
-        # shutdown actions could go here if needed
-
     lifespan_ctx = lifespan
     logger.info("Using modern lifespan startup (USE_MODERN_STARTUP=True)")
+
 
 # ---------- App creation (single app) ----------
 show_docs = settings.ENVIRONMENT.lower() != "prod"
@@ -178,12 +225,20 @@ else:
 # ---------- Expose settings on app.state ----------
 app.state.settings = settings  # type: ignore[attr-defined]
 
+# ---------- Metrics endpoint ----------
+if make_asgi_app is not None:
+    metrics_app = make_asgi_app()
+    app.mount("/metrics", metrics_app)
+else:
+    logger.debug("/metrics not mounted because prometheus_client is missing")
+
 # ---------- Classic startup fallback (if not using lifespan) ----------
 if not settings.USE_MODERN_STARTUP:
     @app.on_event("startup")
     async def _startup_event():
-        # perform warm index when app starts (classic style)
         await _maybe_warm_index()
+        setup_metrics()  # moved here from module-level
+
 
 # ---------- CLI for local dev (not required by uvicorn) ----------
 if __name__ == "__main__":
