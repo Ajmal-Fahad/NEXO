@@ -1,0 +1,190 @@
+# image_utils.py - Helpers to serve processed logos and banners for frontend
+# (S3-first fallback; returns Path that may have .s3_uri and a CDN/static URL)
+
+import re
+import os
+from pathlib import Path
+from typing import Optional, Tuple, List
+
+try:
+    import fsspec
+except Exception:
+    fsspec = None
+
+# -------------------------
+# Config
+# -------------------------
+BASE = Path(__file__).resolve().parents[1]
+PROCESSED_LOGOS = BASE / "input_data" / "images" / "processed_images" / "processed_logos"
+PROCESSED_BANNERS = BASE / "input_data" / "images" / "processed_images" / "processed_banners"
+
+# URL base (frontend can serve these via FastAPI static route)
+URL_BASE = "/static/images"
+PLACEHOLDER_LOGO = "default_logo.png"
+PLACEHOLDER_BANNER = "default_banner.webp"
+
+# S3 fallback and CDN
+S3_PROCESSED_IMAGES_PATH = os.getenv("S3_PROCESSED_IMAGES_PATH", "") or ""
+# CDN_BASE_URL should be the https endpoint that serves your bucket content (CloudFront or S3 website/blob).
+CDN_BASE_URL = os.getenv("CDN_BASE_URL", "https://nexo-cdn.s3.amazonaws.com")
+
+# -------------------------
+# Normalizers
+# -------------------------
+
+def normalize_symbol(sym: str) -> str:
+    """Normalize trading symbol to uppercase with underscores."""
+    if not sym:
+        return ""
+    return re.sub(r"\s+", "_", sym.strip().upper())
+
+
+def slugify_company(name: str) -> str:
+    """Make a lowercase slug from company name (safe for filenames)."""
+    if not name:
+        return ""
+    s = name.lower().strip()
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = re.sub(r"_+", "_", s)
+    return s.strip("_")
+
+# -------------------------
+# Candidate generators
+# -------------------------
+
+def candidate_logo_filenames(symbol: str, company_name: str) -> List[str]:
+    sym = normalize_symbol(symbol)
+    slug = slugify_company(company_name)
+    cands: List[str] = []
+    if sym:
+        cands.append(f"{sym}_logo.png")
+        cands.append(f"{sym.lower()}_logo.png")
+    if slug:
+        cands.append(f"{slug}_logo.png")
+    return cands
+
+
+def candidate_banner_filenames(symbol: str, company_name: str) -> List[str]:
+    sym = normalize_symbol(symbol)
+    slug = slugify_company(company_name)
+    cands: List[str] = []
+    if sym:
+        cands.append(f"{sym}_banner.webp")
+        cands.append(f"{sym.lower()}_banner.webp")
+        cands.append(f"{sym}_banner.png")
+    if slug:
+        cands.append(f"{slug}_banner.webp")
+        cands.append(f"{slug}_banner.png")
+    return cands
+
+# -------------------------
+# Lookup helper
+# -------------------------
+
+def _s3_key_from_uri(s3_uri: str) -> str:
+    """Return the object key (path after bucket) for an s3://bucket/key URI."""
+    # s3_uri is expected like s3://bucket/path/to/object.png
+    if not s3_uri:
+        return ""
+    u = s3_uri[len("s3://") :] if s3_uri.startswith("s3://") else s3_uri
+    parts = u.split("/")
+    if len(parts) <= 1:
+        return ""
+    return "/".join(parts[1:])
+
+
+def find_first_existing(base_dir: Path, candidates: List[str]) -> Optional[Path]:
+    """Return the first existing Path found.
+
+    Priority per your request: prefer S3 (if configured & reachable) then local filesystem.
+
+    If a candidate exists on S3 we return a Path object with an extra attribute `.s3_uri`
+    containing the s3:// URI. Callers can detect that attribute and either use the URL
+    returned by this module or download the object as needed.
+    """
+    # 1) S3-first
+    try:
+        s3_prefix = S3_PROCESSED_IMAGES_PATH.rstrip('/') if S3_PROCESSED_IMAGES_PATH else ''
+        if s3_prefix and s3_prefix.lower().startswith('s3://') and fsspec is not None:
+            fs = fsspec.filesystem('s3')
+            for fn in candidates:
+                key = f"{s3_prefix.rstrip('/')}/{fn}"
+                try:
+                    if fs.exists(key):
+                        p = Path(fn)
+                        setattr(p, 's3_uri', key)
+                        return p
+                except Exception:
+                    # ignore and continue
+                    continue
+    except Exception:
+        # any S3 failure -> fallback to local
+        pass
+
+    # 2) local fallback
+    for fn in candidates:
+        p = base_dir / fn
+        if p.exists():
+            return p
+
+    return None
+
+# -------------------------
+# URL builder helper
+# -------------------------
+
+def _url_for_path(path: Path, base_dir: Path, url_subpath: str) -> str:
+    """Return URL for a Path-like candidate. If path has `.s3_uri`, use CDN_BASE_URL.
+
+    url_subpath should be the folder under URL_BASE (e.g. 'processed_logos').
+    """
+    # If caller returned a Path with attached s3_uri attribute, prefer CDN URL
+    s3_uri = getattr(path, 's3_uri', None)
+    if s3_uri:
+        # derive object key (path after bucket) and join with CDN_BASE_URL
+        key = _s3_key_from_uri(s3_uri).lstrip('/')
+        if key:
+            return f"{CDN_BASE_URL}/{key}"
+    # else local file -> use standard static URL
+    return f"{URL_BASE}/{url_subpath}/{path.name}"
+
+# -------------------------
+# Public API
+# -------------------------
+
+def get_logo_path(symbol: str, company_name: str) -> Tuple[Path, str]:
+    """Returns (filesystem_path_or_candidate, url) for logo.
+
+    The returned Path may be a nominal Path whose `.s3_uri` attribute points to S3.
+    """
+    candidates = candidate_logo_filenames(symbol, company_name)
+    path = find_first_existing(PROCESSED_LOGOS, candidates)
+    if not path:
+        path = PROCESSED_LOGOS / PLACEHOLDER_LOGO
+    url = _url_for_path(path, PROCESSED_LOGOS, 'processed_logos')
+    return path, url
+
+
+def get_banner_path(symbol: str, company_name: str) -> Tuple[Path, str]:
+    """Returns (filesystem_path_or_candidate, url) for banner."""
+    candidates = candidate_banner_filenames(symbol, company_name)
+    path = find_first_existing(PROCESSED_BANNERS, candidates)
+    if not path:
+        path = PROCESSED_BANNERS / PLACEHOLDER_BANNER
+    url = _url_for_path(path, PROCESSED_BANNERS, 'processed_banners')
+    return path, url
+
+# -------------------------
+# CLI test
+# -------------------------
+if __name__ == "__main__":
+    sym = "RELIANCE"
+    name = "Reliance Industries Limited"
+
+    logo_path, logo_url = get_logo_path(sym, name)
+    banner_path, banner_url = get_banner_path(sym, name)
+
+    print("Logo Path:", logo_path)
+    print("Logo URL:", logo_url)
+    print("Banner Path:", banner_path)
+    print("Banner URL:", banner_url)

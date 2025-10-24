@@ -18,7 +18,6 @@ Behavior:
 """
 from __future__ import annotations
 
-import pandas as pd
 import csv
 import glob
 import os
@@ -103,90 +102,11 @@ def _similarity_ratio(a: str, b: str) -> float:
 
 # ---- CSV helpers (fallback) ----
 def _load_latest_csv(csv_path: Optional[str] = None) -> Optional[str]:
-    """Return a local CSV filepath to use.
-
-    Priority:
-      1. If csv_path is provided and exists locally -> return it
-      2. Try local filesystem glob (CSV_GLOB) -> return newest file
-      3. If S3 env var present (S3_PROCESSED_CSV_PATH) and fsspec available ->
-         list S3 prefix, pick newest candidate and download to a temporary file
-         and return the local temp filename.
-
-    The function never raises; returns None on failure.
-    """
     try:
-        # explicit local override
         if csv_path:
             return csv_path if os.path.exists(csv_path) else None
-
-        # 1) try local filesystem glob
         files = sorted(glob.glob(CSV_GLOB))
-        if files:
-            return files[-1]
-
-        # 2) try S3 fallback if environment variable set
-        s3_env = os.getenv("S3_PROCESSED_CSV_PATH", "") or ""
-        s3_env = s3_env.strip()
-        if not s3_env:
-            return None
-        # normalize simple cases where user provided a bucket/key without scheme
-        if not s3_env.lower().startswith("s3://") and "nexo-storage-ca" in s3_env:
-            s3_env = "s3://" + s3_env
-        if not s3_env.lower().startswith("s3://"):
-            # not an s3 URI we understand
-            return None
-
-        try:
-            # import fsspec on demand to avoid hard dependency at module import
-            import fsspec
-            fs = fsspec.filesystem("s3")
-            prefix = s3_env.rstrip('/')
-            # prefer processed_*.csv names, fallback to any .csv
-            candidates = fs.glob(f"{prefix}/processed_*.csv") or fs.glob(f"{prefix}/*.csv")
-            if not candidates:
-                return None
-
-            # prefer filenames with an embedded date like YYYY-MM-DD or YYYYMMDD
-            date_re = re.compile(r"(\d{4})[-_]?(\d{2})[-_]?(\d{2})")
-            dated = []
-            for p in candidates:
-                name = p.split('/')[-1]
-                m = date_re.search(name)
-                if m:
-                    try:
-                        y, mo, d = map(int, m.groups())
-                        ts = pd.Timestamp(year=y, month=mo, day=d)
-                        dated.append((ts, p))
-                    except Exception:
-                        continue
-            chosen = None
-            if dated:
-                dated.sort(key=lambda x: x[0], reverse=True)
-                chosen = dated[0][1]
-            else:
-                # lexicographic fallback
-                chosen = sorted(candidates)[-1]
-
-            # ensure chosen is a str s3:// URI
-            chosen_uri = str(chosen)
-            if not chosen_uri.lower().startswith('s3://'):
-                chosen_uri = 's3://' + chosen_uri.lstrip('/')
-
-            # download to temp file and return local path
-            import tempfile
-            with tempfile.NamedTemporaryFile(suffix='.csv', delete=False) as tmp:
-                tmp_path = tmp.name
-                with fs.open(chosen_uri, 'rb') as f:
-                    # stream-copy
-                    while True:
-                        chunk = f.read(16 * 1024)
-                        if not chunk:
-                            break
-                        tmp.write(chunk)
-            return tmp_path
-        except Exception:
-            return None
-
+        return files[-1] if files else None
     except Exception:
         return None
 

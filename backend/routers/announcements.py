@@ -5,7 +5,7 @@ from pathlib import Path
 import json
 import re
 from datetime import datetime
-from schemas.schema import AnnouncementListItem, AnnouncementDetail, MarketSnapshot
+from backend.schemas.schema import AnnouncementListItem, AnnouncementDetail, MarketSnapshot
 
 import logging
 from pathlib import Path as _Path

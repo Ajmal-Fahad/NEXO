@@ -80,6 +80,17 @@ def _normalize_company_name(s: Optional[str]) -> str:
     s2 = _spaces_re.sub(" ", str(s)).strip()
     return s2.lower()
 
+# Prefix-match tuning (used for filename-like prefix prioritization)
+PREFIX_MIN = 3
+PREFIX_MAX = 10
+
+def _prefix_from_filename_fn(name: Optional[str]) -> str:
+    """Compact string by removing non-alnum characters and returning the first PREFIX_MAX chars (uppercased)."""
+    if not name:
+        return ""
+    compacted = re.sub(r"[^A-Za-z0-9]+", "", str(name)).upper()
+    return compacted[:PREFIX_MAX]
+
 def _similarity(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
@@ -228,6 +239,7 @@ def get_symbol_by_token(token: str) -> Optional[str]:
     If a token maps to one or more symbols, return a best candidate:
      - prefer exact token == symbol
      - else pick shortest symbol (heuristic)
+     - else prefer symbols with first 6-7 characters matching token prefix
     """
     if not token:
         return None
@@ -238,6 +250,14 @@ def get_symbol_by_token(token: str) -> Optional[str]:
             return None
         if t in candidates:
             return t
+        # prefix-based prioritization: filter candidates whose first 6-7 chars match token prefix
+        prefix_len = min(7, len(t))
+        prefix = t[:prefix_len]
+        prefix_matches = [c for c in candidates if c[:prefix_len].upper() == prefix]
+        if prefix_matches:
+            # among prefix matches, pick shortest symbol then lexicographic
+            prefix_matches_sorted = sorted(prefix_matches, key=lambda x: (len(x), x))
+            return prefix_matches_sorted[0]
         # heuristic: prefer shortest symbol name then lexicographic
         candidates_sorted = sorted(candidates, key=lambda x: (len(x), x))
         return candidates_sorted[0]
@@ -248,6 +268,7 @@ def fuzzy_lookup_symbol(query: str, min_ratio: float = DEFAULT_MIN_FUZZY_RATIO) 
       - check compact-company direct match
       - gather token candidate symbols and score by token overlap + similarity
       - final scan over compacts/symbols using SequenceMatcher
+      - prefer candidates with first 6-7 chars matching query prefix (case-insensitive)
     Returns canonical SYMBOL (UPPER) or None.
     """
     if not query:
@@ -261,7 +282,12 @@ def fuzzy_lookup_symbol(query: str, min_ratio: float = DEFAULT_MIN_FUZZY_RATIO) 
         if q_compact and q_compact in _compact_map:
             return _compact_map[q_compact]
 
-        # tokens path: collect candidate symbols from tokens
+        # prefix-based prioritization: try to apply filename_utils logic
+        try:
+            q_prefix = _prefix_from_filename_fn(q)
+        except Exception:
+            q_prefix = ""
+        prefix_len = len(q_prefix)
         q_toks = _tokens(q)
         if q_toks:
             cand_symbols: Set[str] = set()
@@ -271,10 +297,17 @@ def fuzzy_lookup_symbol(query: str, min_ratio: float = DEFAULT_MIN_FUZZY_RATIO) 
             if len(cand_symbols) == 1:
                 return next(iter(cand_symbols))
 
+            # If we have a meaningful compact prefix, prefer candidates matching that prefix
+            if q_prefix and len(q_prefix) >= PREFIX_MIN:
+                prefix_matches = [sym for sym in cand_symbols if str(sym).upper().startswith(q_prefix)]
+                candidates_to_score = prefix_matches if prefix_matches else list(cand_symbols)
+            else:
+                candidates_to_score = list(cand_symbols)
+
             # score candidates
             best_sym = None
             best_score = 0.0
-            for sym in cand_symbols:
+            for sym in candidates_to_score:
                 # compute tokens for sym + its company name
                 sym_tokens = set(_tokens(sym) + _tokens(_symbol_map.get(sym, {}).get("company_name", "") if sym in _symbol_map else []))
                 common = len(set(q_toks).intersection(sym_tokens))

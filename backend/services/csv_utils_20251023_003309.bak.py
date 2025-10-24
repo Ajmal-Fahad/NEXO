@@ -102,42 +102,50 @@ def _ensure_s3_uri(val: str) -> str:
 def find_latest_processed_eod() -> Optional[Path]:
     """Return newest processed_*.csv in PROCESSED_DIR or S3 path string.
 
-    This version is S3-first and mirrors the behaviour used in services.image_utils:
-      - read S3 configuration at module import time (PROCESSED_S3 / PROCESSED_DIR)
-      - use fsspec when available to list S3 prefixes
-      - return an `s3://...` string for S3 results, otherwise return a pathlib.Path
+    If S3_PROCESSED_CSV_PATH is set the function will attempt to list that S3
+    prefix (via fsspec) and return a best candidate as an s3://... string.
+    Otherwise it returns a pathlib.Path for local files.
     """
-    # If module-level flag indicates PROCESSED_DIR is an S3 prefix, try S3 listing first
-    if PROCESSED_S3:
+    # Prefer environment S3 listing when available
+    s3_env = (os.getenv("S3_PROCESSED_CSV_PATH") or "").strip()
+    # Backwards-tolerant: accept either full s3:// or bucket-relative that contains known bucket name
+    if s3_env and not s3_env.lower().startswith("s3://") and "nexo-storage-ca" in s3_env:
+        s3_env = "s3://" + s3_env
+    if s3_env:
         try:
             import fsspec
-            fs = fsspec.filesystem("s3")
-            prefix = str(PROCESSED_DIR).rstrip("/")
-            # prefer processed_*.csv then any .csv
-            candidates = fs.glob(f"{prefix}/processed_*.csv") or fs.glob(f"{prefix}/*.csv")
-            if candidates:
-                # prefer dated filenames when present
-                dated: List[Tuple[pd.Timestamp, str]] = []
-                for p in candidates:
-                    name = str(p).split("/")[-1]
-                    m = DATE_RE.search(name)
-                    if m:
-                        try:
-                            y, mo, d = map(int, m.groups())
-                            ts = pd.Timestamp(year=y, month=mo, day=d)
-                            dated.append((ts, str(p)))
-                        except Exception:
-                            continue
-                if dated:
-                    dated.sort(key=lambda x: x[0], reverse=True)
-                    return _ensure_s3_uri(dated[0][1])
-                # fallback to lexicographic newest
-                return _ensure_s3_uri(sorted(map(str, candidates))[-1])
-        except Exception:
-            _log("s3 listing failed - falling back to local discovery")
 
-    # Local filesystem fallback (PROCESSED_DIR may be a Path or string)
-    local_processed_dir = Path(PROCESSED_DIR) if not isinstance(PROCESSED_DIR, str) else Path(str(PROCESSED_DIR))
+            fs = fsspec.filesystem("s3")
+            prefix = s3_env.rstrip("/")
+            # prefer processed_*.csv filenames first, otherwise any .csv
+            candidates = fs.glob(f"{prefix}/processed_*.csv") or fs.glob(f"{prefix}/*.csv")
+            if not candidates:
+                return None
+
+            # prefer filenames with date pattern
+            dated: List[Tuple[pd.Timestamp, str]] = []
+            for p in candidates:
+                name = str(p).split("/")[-1]
+                m = DATE_RE.search(name)
+                if m:
+                    try:
+                        y, mo, d = map(int, m.groups())
+                        ts = pd.Timestamp(year=y, month=mo, day=d)
+                        dated.append((ts, str(p)))
+                    except Exception:
+                        continue
+            if dated:
+                dated.sort(key=lambda x: x[0], reverse=True)
+                return _ensure_s3_uri(dated[0][1])
+            # fallback: lexicographic newest
+            return _ensure_s3_uri(sorted(map(str, candidates))[-1])
+        except Exception:
+            # fallback to local behavior below
+            _log("s3 listing failed - falling back to local discovery")
+            pass
+
+    # Local filesystem fallback
+    local_processed_dir = Path(PROCESSED_DIR) if isinstance(PROCESSED_DIR, str) else PROCESSED_DIR
     if not local_processed_dir.exists():
         return None
     candidates = list(local_processed_dir.glob("processed_*.csv"))

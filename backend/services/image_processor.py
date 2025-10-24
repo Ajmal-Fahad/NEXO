@@ -22,11 +22,13 @@ Notes:
 """
 
 from pathlib import Path
-from PIL import Image, ImageOps
+from PIL import Image
 import argparse
 import shutil
 import sys
 import logging
+
+import os
 
 BASE = Path(__file__).resolve().parents[1]  # backend/
 RAW_LOGOS = BASE / "input_data" / "images" / "raw_images" / "raw_logos"
@@ -176,32 +178,197 @@ def process_banner_file(path: Path, overwrite: bool = True, quality: int = DEFAU
     return out_path
 
 
+
+def _download_s3_prefix_to_local(s3_prefix: str, local_dir: Path) -> bool:
+    """
+    Download all objects under s3_prefix (expected like s3://bucket/path) into local_dir.
+    Returns True on success, False otherwise.
+    """
+    try:
+        import fsspec
+    except Exception as e:
+        logger.debug("fsspec not available for S3 download: %s", e)
+        return False
+
+    try:
+        fs = fsspec.filesystem("s3")
+        prefix = s3_prefix.rstrip("/")
+        # list keys under prefix
+        entries = fs.glob(f"{prefix}/*")
+        if not entries:
+            logger.debug("No S3 entries under %s", prefix)
+            return False
+        local_dir.mkdir(parents=True, exist_ok=True)
+        for key in entries:
+            # skip trailing "folders" returned by some backends
+            name = key.split("/")[-1]
+            if not name:
+                continue
+            dest = local_dir / name
+            with fs.open(key, "rb") as r, open(dest, "wb") as w:
+                while True:
+                    chunk = r.read(16 * 1024)
+                    if not chunk:
+                        break
+                    w.write(chunk)
+        logger.info("Downloaded S3 prefix %s -> %s", prefix, local_dir)
+        return True
+    except Exception as e:
+        logger.exception("S3 download failed for %s: %s", s3_prefix, e)
+        return False
+
+
+def _upload_dir_to_s3(local_dir: Path, s3_prefix: str) -> bool:
+    """
+    Upload files from local_dir into s3_prefix (s3://bucket/path). Returns True on success.
+    """
+    try:
+        import fsspec
+    except Exception as e:
+        logger.debug("fsspec not available for S3 upload: %s", e)
+        return False
+
+    try:
+        fs = fsspec.filesystem("s3")
+        prefix = s3_prefix.rstrip("/")
+        for p in sorted(local_dir.glob("*")):
+            if not p.is_file():
+                continue
+            key = f"{prefix}/{p.name}"
+            with open(p, "rb") as r, fs.open(key, "wb") as w:
+                while True:
+                    chunk = r.read(16 * 1024)
+                    if not chunk:
+                        break
+                    w.write(chunk)
+        logger.info("Uploaded %s -> %s", local_dir, prefix)
+        return True
+    except Exception as e:
+        logger.exception("S3 upload failed for %s: %s", s3_prefix, e)
+        return False
+
+
 def process_all_batch(overwrite: bool = True, quality: int = DEFAULT_WEBP_QUALITY, verbose: bool = False):
     """
     Process everything found in RAW_LOGOS and RAW_BANNERS directories.
+    Supports optional S3 fallback — set environment variables:
+      S3_RAW_IMAGES_PATH        e.g. "s3://nexo-storage-ca/input_data/images/raw_images"
+      S3_PROCESSED_IMAGES_PATH  e.g. "s3://nexo-storage-ca/input_data/images/processed_images"
+
+    Behaviour:
+      - If S3_RAW_IMAGES_PATH is set and reachable, download raw logos/banners to a temp dir,
+        process them locally, and (if S3_PROCESSED_IMAGES_PATH set) upload outputs back to S3.
+      - Otherwise fall back to local RAW_LOGOS / RAW_BANNERS processing as before.
     """
+    import tempfile
+    from pathlib import Path as _Path
     if verbose:
         logger.setLevel(logging.DEBUG)
-    logger.info("Processing RAW logos in: %s", RAW_LOGOS)
-    logo_paths = sorted(RAW_LOGOS.glob("*"))
-    processed = 0
-    for p in logo_paths:
-        if p.is_file():
-            res = process_logo_file(p, overwrite=overwrite)
-            if res:
-                processed += 1
 
-    logger.info("Processing RAW banners in: %s", RAW_BANNERS)
-    banner_paths = sorted(RAW_BANNERS.glob("*"))
-    processed_b = 0
-    for p in banner_paths:
-        if p.is_file():
-            res = process_banner_file(p, overwrite=overwrite, quality=quality)
-            if res:
-                processed_b += 1
+    s3_raw = os.getenv("S3_RAW_IMAGES_PATH", "") or ""
+    s3_proc = os.getenv("S3_PROCESSED_IMAGES_PATH", "") or ""
 
-    logger.info("Batch complete. logos=%d, banners=%d", processed, processed_b)
-    return processed, processed_b
+    # Helper to decide whether to use S3 path; caller supplies full prefix e.g. s3://bucket/.../raw_logos
+    use_s3 = bool(s3_raw and s3_raw.lower().startswith("s3://"))
+
+    # If using S3, create temp local dirs for raw inputs and processed outputs
+    temp_raw_logos = None
+    temp_raw_banners = None
+    temp_proc_logos = None
+    temp_proc_banners = None
+
+    try:
+        if use_s3:
+            # S3 raw paths expected to contain raw_logos/raw_banners suffixes OR be the raw_images prefix
+            base_raw = s3_raw.rstrip("/")
+            logos_prefix = base_raw + "/raw_logos"
+            banners_prefix = base_raw + "/raw_banners"
+
+            tmpdir = _Path(tempfile.mkdtemp(prefix="imgproc_raw_"))
+            temp_raw_logos = tmpdir / "raw_logos"
+            temp_raw_banners = tmpdir / "raw_banners"
+            ok1 = _download_s3_prefix_to_local(logos_prefix, temp_raw_logos)
+            ok2 = _download_s3_prefix_to_local(banners_prefix, temp_raw_banners)
+            if not (ok1 or ok2):
+                logger.info("S3 RAW download not available or empty; falling back to local folders.")
+                use_s3 = False
+            else:
+                # write processed outputs locally under another temp dir and upload later
+                out_tmp = _Path(tempfile.mkdtemp(prefix="imgproc_out_"))
+                temp_proc_logos = out_tmp / "processed_logos"
+                temp_proc_banners = out_tmp / "processed_banners"
+                temp_proc_logos.mkdir(parents=True, exist_ok=True)
+                temp_proc_banners.mkdir(parents=True, exist_ok=True)
+        # If not using S3, operate on real local folders
+        if not use_s3:
+            logger.info("Processing RAW logos in (local): %s", RAW_LOGOS)
+            logo_paths = sorted(RAW_LOGOS.glob("*"))
+            processed = 0
+            for p in logo_paths:
+                if p.is_file():
+                    res = process_logo_file(p, overwrite=overwrite)
+                    if res:
+                        processed += 1
+
+            logger.info("Processing RAW banners in (local): %s", RAW_BANNERS)
+            banner_paths = sorted(RAW_BANNERS.glob("*"))
+            processed_b = 0
+            for p in banner_paths:
+                if p.is_file():
+                    res = process_banner_file(p, overwrite=overwrite, quality=quality)
+                    if res:
+                        processed_b += 1
+
+            logger.info("Batch complete. logos=%d, banners=%d", processed, processed_b)
+            return processed, processed_b
+
+        # If reached here, we have S3 downloaded to temp dirs; process those and save outputs into temp_proc_*
+        logger.info("Processing RAW logos (from S3) in: %s", temp_raw_logos)
+        processed = 0
+        for p in sorted(temp_raw_logos.glob("*")) if temp_raw_logos.exists() else []:
+            if p.is_file():
+                # process but write outputs into temp_proc_logos — reuse existing functions by temporarily
+                # calling process_logo_file on the source but then move/copy produced file into temp out dir.
+                res = process_logo_file(p, overwrite=overwrite)
+                if res and Path(res).exists():
+                    # move saved file into temp_proc_logos
+                    dest = temp_proc_logos / Path(res).name
+                    shutil.copy(Path(res), dest)
+                    processed += 1
+
+        logger.info("Processing RAW banners (from S3) in: %s", temp_raw_banners)
+        processed_b = 0
+        for p in sorted(temp_raw_banners.glob("*")) if temp_raw_banners.exists() else []:
+            if p.is_file():
+                res = process_banner_file(p, overwrite=overwrite, quality=quality)
+                if res and Path(res).exists():
+                    dest = temp_proc_banners / Path(res).name
+                    shutil.copy(Path(res), dest)
+                    processed_b += 1
+
+        logger.info("Batch complete (S3 flow). logos=%d, banners=%d", processed, processed_b)
+
+        # Upload results back to S3 if target set
+        if s3_proc and s3_proc.lower().startswith("s3://"):
+            base_proc = s3_proc.rstrip("/")
+            proc_logos_prefix = base_proc + "/processed_logos"
+            proc_banners_prefix = base_proc + "/processed_banners"
+            ok_up1 = _upload_dir_to_s3(temp_proc_logos, proc_logos_prefix) if temp_proc_logos and temp_proc_logos.exists() else False
+            ok_up2 = _upload_dir_to_s3(temp_proc_banners, proc_banners_prefix) if temp_proc_banners and temp_proc_banners.exists() else False
+            logger.info("S3 upload completed: logos=%s, banners=%s", ok_up1, ok_up2)
+
+        return processed, processed_b
+
+    finally:
+        # cleanup temp dirs if any (careful: keep local processed outputs if desired)
+        try:
+            if temp_raw_logos and temp_raw_logos.parent.exists():
+                shutil.rmtree(temp_raw_logos.parent)
+            if 'out_tmp' in locals() and _Path(out_tmp).exists():
+                # keep out_tmp? remove to avoid clutter
+                shutil.rmtree(out_tmp)
+        except Exception:
+            pass
 
 
 def process_single(path_str: str, kind: str = "auto", overwrite: bool = True, quality: int = DEFAULT_WEBP_QUALITY):

@@ -1,0 +1,254 @@
+"""
+image_utils.py - Helpers to serve processed logos and banners for frontend
+
+Behaviour:
+ - Prefer S3 (if configured and reachable) then local filesystem.
+ - If S3 object is found this module returns a lightweight S3Candidate object
+   with attributes `.name` and `.s3_uri`. Local files return a real pathlib.Path.
+ - Returned URL will use CDN_BASE_URL for S3 objects (if configured) or the
+   local static URL (/static/images/...) for local files.
+
+Environment variables used:
+ - S3_PROCESSED_IMAGES_PATH  e.g. "s3://nexo-storage-ca/input_data/images/processed_images"
+ - CDN_BASE_URL              e.g. "https://<your-cloudfront-domain>"
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from pathlib import Path
+from typing import List, Optional, Tuple
+# Auto-load .env from project root if available
+from dotenv import load_dotenv
+from pathlib import Path
+load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / '.env')
+
+
+# optional dependency
+try:
+    import fsspec
+except Exception:  # pragma: no cover - optional in tests
+    fsspec = None
+
+# -------------------------
+# Config
+# -------------------------
+BASE = Path(__file__).resolve().parents[1]
+PROCESSED_LOGOS = BASE / "input_data" / "images" / "processed_images" / "processed_logos"
+PROCESSED_BANNERS = BASE / "input_data" / "images" / "processed_images" / "processed_banners"
+
+URL_BASE = "/static/images"
+PLACEHOLDER_LOGO = "default_logo.png"
+PLACEHOLDER_BANNER = "default_banner.webp"
+
+# read environment at import time (can be overridden by callers setting env before import)
+S3_PROCESSED_IMAGES_PATH = os.getenv("S3_PROCESSED_IMAGES_PATH", "").strip()
+CDN_BASE_URL = os.getenv("CDN_BASE_URL", "").strip()
+
+# -------------------------
+# Small helpers
+# -------------------------
+
+
+def normalize_symbol(sym: str) -> str:
+    """Normalize trading symbol to uppercase with underscores."""
+    if not sym:
+        return ""
+    return re.sub(r"\s+", "_", sym.strip().upper())
+
+
+def slugify_company(name: str) -> str:
+    """Make a lowercase slug from company name (safe for filenames)."""
+    if not name:
+        return ""
+    s = name.lower().strip()
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = re.sub(r"_+", "_", s)
+    return s.strip("_")
+
+
+# -------------------------
+# Candidate filename generators
+# -------------------------
+
+
+def candidate_logo_filenames(symbol: str, company_name: str) -> List[str]:
+    sym = normalize_symbol(symbol)
+    slug = slugify_company(company_name)
+    cands: List[str] = []
+    if sym:
+        cands.append(f"{sym}_logo.png")
+        cands.append(f"{sym.lower()}_logo.png")
+    if slug:
+        cands.append(f"{slug}_logo.png")
+    return cands
+
+
+def candidate_banner_filenames(symbol: str, company_name: str) -> List[str]:
+    sym = normalize_symbol(symbol)
+    slug = slugify_company(company_name)
+    cands: List[str] = []
+    if sym:
+        cands.append(f"{sym}_banner.webp")
+        cands.append(f"{sym.lower()}_banner.webp")
+        cands.append(f"{sym}_banner.png")
+    if slug:
+        cands.append(f"{slug}_banner.webp")
+        cands.append(f"{slug}_banner.png")
+    return cands
+
+
+# -------------------------
+# S3 candidate object
+# -------------------------
+
+
+class S3Candidate:
+    """
+    Lightweight object representing a candidate that lives on S3.
+    - .name is the filename
+    - .s3_uri is the full s3://... URI
+
+    This is intentionally NOT a pathlib.Path subclass to allow storing metadata.
+    """
+
+    def __init__(self, name: str, s3_uri: str) -> None:
+        self.name = name
+        self.s3_uri = s3_uri
+
+    def __str__(self) -> str:
+        return self.name
+
+    # path-like compatibility if some consumer uses os.fspath()
+    def __fspath__(self) -> str:  # type: ignore[override]
+        return self.name
+
+
+# -------------------------
+# Lookup helper
+# -------------------------
+
+
+def _s3_object_key_from_s3_uri(s3_uri: str) -> str:
+    """Return object key (path after bucket) for s3://bucket/key or bucket/key."""
+    if not s3_uri:
+        return ""
+    u = s3_uri[len("s3://") :] if s3_uri.startswith("s3://") else s3_uri
+    parts = u.split("/", 1)
+    return parts[1] if len(parts) > 1 else ""
+
+
+def find_first_existing(base_dir: Path, candidates: List[str]) -> Optional[Path]:
+    """
+    Find the first existing candidate.
+
+    Priority:
+      1) If S3_PROCESSED_IMAGES_PATH is set and fsspec available, check S3 (preferred).
+         - check prefix/subdir/filename then prefix/filename.
+         - if found return S3Candidate(name, s3_uri)
+      2) Otherwise check local filesystem, return pathlib.Path if exists.
+    """
+    s3_prefix = S3_PROCESSED_IMAGES_PATH.strip()
+    if s3_prefix and s3_prefix.lower().startswith("s3://") and fsspec is not None:
+        try:
+            fs = fsspec.filesystem("s3")
+            subdir = base_dir.name if isinstance(base_dir, Path) else str(base_dir).rstrip("/").split("/")[-1]
+            for fn in candidates:
+                key2 = f"{s3_prefix.rstrip('/')}/{subdir}/{fn}"
+                key1 = f"{s3_prefix.rstrip('/')}/{fn}"
+                # check key2 then key1
+                try:
+                    if fs.exists(key2):
+                        return S3Candidate(fn, key2)
+                except Exception:
+                    # ignore and continue
+                    pass
+                try:
+                    if fs.exists(key1):
+                        return S3Candidate(fn, key1)
+                except Exception:
+                    # ignore and continue
+                    pass
+        except Exception:
+            # any S3-level exception should silently fall back to local
+            pass
+
+    # local fallback
+    for fn in candidates:
+        p = base_dir / fn
+        if p.exists():
+            return p
+
+    return None
+
+
+# -------------------------
+# URL builder
+# -------------------------
+
+
+def _url_for_path(candidate, url_subpath: str) -> str:
+    """
+    Build public URL for candidate:
+      - If candidate is S3Candidate and CDN_BASE_URL set -> CDN_BASE_URL/<object-key>
+      - Else -> /static/images/<url_subpath>/<filename>
+    """
+    s3_uri = getattr(candidate, "s3_uri", None)
+    if s3_uri and CDN_BASE_URL:
+        key = _s3_object_key_from_s3_uri(s3_uri).lstrip("/")
+        return f"{CDN_BASE_URL.rstrip('/')}/{key}"
+    # assume candidate has .name for filename (Path has .name)
+    filename = getattr(candidate, "name", getattr(candidate, "name", None))
+    if filename is None and hasattr(candidate, "name"):
+        filename = candidate.name  # fallback
+    if filename is None and hasattr(candidate, "name"):
+        filename = candidate.name
+    # If candidate is a Path and has .name, above will provide it; else fallback:
+    if filename is None and hasattr(candidate, "name"):
+        filename = candidate.name
+    return f"{URL_BASE}/{url_subpath}/{filename}"
+
+
+# -------------------------
+# Public API
+# -------------------------
+
+
+def get_logo_path(symbol: str, company_name: str) -> Tuple[Path | S3Candidate, str]:
+    """Return (path_like_or_s3candidate, url) for logo. Prefer S3 then local."""
+    candidates = candidate_logo_filenames(symbol, company_name)
+    res = find_first_existing(PROCESSED_LOGOS, candidates)
+    if not res:
+        # local placeholder
+        res = PROCESSED_LOGOS / PLACEHOLDER_LOGO
+    url = _url_for_path(res, "processed_logos")
+    return res, url
+
+
+def get_banner_path(symbol: str, company_name: str) -> Tuple[Path | S3Candidate, str]:
+    """Return (path_like_or_s3candidate, url) for banner. Prefer S3 then local."""
+    candidates = candidate_banner_filenames(symbol, company_name)
+    res = find_first_existing(PROCESSED_BANNERS, candidates)
+    if not res:
+        res = PROCESSED_BANNERS / PLACEHOLDER_BANNER
+    url = _url_for_path(res, "processed_banners")
+    return res, url
+
+
+# -------------------------
+# CLI quick test
+# -------------------------
+if __name__ == "__main__":
+    sym = "RELIANCE"
+    name = "Reliance Industries Limited"
+
+    lp, lu = get_logo_path(sym, name)
+    bp, bu = get_banner_path(sym, name)
+
+    print("Logo path:", lp)
+    print("Logo s3_uri:", getattr(lp, "s3_uri", None))
+    print("Logo URL:", lu)
+    print("Banner path:", bp)
+    print("Banner s3_uri:", getattr(bp, "s3_uri", None))
+    print("Banner URL:", bu)

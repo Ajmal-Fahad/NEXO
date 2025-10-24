@@ -2,18 +2,30 @@
 """
 services/pdf_processor.py
 
-Refactored PDF -> announcement master JSON processor (v2.0, cleaned)
+Refactored, robust PDF -> announcement master JSON processor (v2.0).
 
-Changes in this rewrite (high level):
- - Consolidated datetime extraction into a single helper that always returns a dict.
- - Removed duplicate image/logo lookups (images resolved during enrichment only).
- - Centralized numpy/pandas detection at module-import time for make_json_safe.
- - Simplified PdfReader use: extractor handles PdfReader availability.
- - Removed unused/ambiguous s3_prefix usage and rely on S3_BUCKET_ROOT env var.
- - Added small LRU caches for market snapshot / indices / image lookups to reduce repeated I/O.
- - Kept behavior (S3-aware wrapper, atomic JSON write, processing_events) consistent with previous file.
+Responsibilities:
+ - Use filename_utils.filename_to_symbol() to resolve canonical symbol/company_name.
+ - Extract announcement datetime from filename (via filename_utils).
+ - Extract text from PDF using pypdf (if available).
+ - Enrich using csv_utils.get_market_snapshot and csv_utils.get_indices_for_symbol.
+ - Get images via image_utils.get_logo_path/get_banner_path.
+ - Call llm_utils for headline and summary and sentiment_utils for blended sentiment.
+ - Write master JSON atomically and move processed PDF into date-based folder.
+ - Maintain processing_events for debugging/audit.
 
-This file is intended to overwrite the existing services/pdf_processor.py.
+Behavior:
+ - S3-first then local fallback, consistent with image_utils/csv_utils.
+ - Warm caches for csv_utils/index_builder at import time (non-forced) to avoid duplicate loads.
+ - process_pdf(pdf_path: Path) operates on local Path objects and performs text extraction,
+   enrichment, JSON write and moving to processed folder (local).
+ - process_single_pdf(s3_or_local: str, ...) is S3-aware wrapper:
+     * Accepts either local path or s3://bucket/key.pdf
+     * If S3: downloads to a temp local file, calls process_pdf, then uploads:
+         - processed PDF -> s3://<bucket>/input_data/pdf/processed/<YYYY-MM-DD>/<filename>
+         - JSON -> s3://<bucket>/data/announcements/<YYYY-MM-DD>/<file_id>.json
+       (respects `overwrite` flag for uploads)
+     * Returns master dict and upload metadata.
 """
 
 from __future__ import annotations
@@ -30,7 +42,6 @@ import re
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List, Tuple
-from functools import lru_cache
 
 # Attempt to import local services (fall back to top-level imports if run differently)
 try:
@@ -67,6 +78,7 @@ VERSION = "pdf_processor_v2.0"
 
 # Local directories (relative to repository)
 BASE = Path(__file__).resolve().parents[1]
+INCOMING_PDF_DIR = BASE / "input_data" / "pdf"
 PROCESSED_JSON_BASE = BASE / "data" / "announcements"
 PROCESSED_PDF_BASE = BASE / "input_data" / "pdf" / "processed"
 ERROR_DIR = BASE / "error_reports"
@@ -79,40 +91,23 @@ for d in (PROCESSED_JSON_BASE, PROCESSED_PDF_BASE, ERROR_DIR):
         pass
 
 # ---------------------------
-# Module-level optional deps detection (avoid repeated imports in hot functions)
+# Warm caches at import time
 # ---------------------------
+# Important: call non-forced loading so we don't reload CSV every time.
 try:
-    import numpy as _np  # type: ignore
-    HAS_NUMPY = True
-except Exception:
-    _np = None
-    HAS_NUMPY = False
-
-try:
-    import pandas as _pd  # type: ignore
-    HAS_PANDAS = True
-except Exception:
-    _pd = None
-    HAS_PANDAS = False
-
-# ---------------------------
-# Warm caches at import time (best-effort, non-fatal)
-# ---------------------------
-try:
+    # load processed df if csv_utils provides it (non-forced)
     if getattr(csv_utils, "load_processed_df", None):
         try:
             csv_utils.load_processed_df(force_reload=False)
         except TypeError:
+            # some implementations may not accept force_reload param
             try:
                 csv_utils.load_processed_df()
             except Exception:
                 pass
         except Exception:
             pass
-except Exception:
-    pass
-
-try:
+    # warm index_builder if available
     if getattr(index_builder, "refresh_index", None):
         try:
             index_builder.refresh_index()
@@ -124,11 +119,13 @@ try:
         except Exception:
             pass
 except Exception:
+    # never fail import because of warm-up
     pass
 
 # ---------------------------
 # Helper functions
 # ---------------------------
+
 
 def now_iso() -> str:
     """Return current IST time as ISO string with tzinfo."""
@@ -139,32 +136,33 @@ def compute_sha1(path: Path) -> str:
     """Compute SHA1 of a local Path file."""
     h = hashlib.sha1()
     with path.open("rb") as f:
-        while True:
-            chunk = f.read(8192)
-            if not chunk:
-                break
+        for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
     return h.hexdigest()
 
 
-def make_json_safe(obj: Any) -> Any:
+def make_json_safe(obj):
     """
-    Convert non-JSON-friendly objects into JSON-safe types.
-    Uses module-level _np / _pd detection to avoid repeated imports.
+    Convert non-JSON-friendly objects into JSON safe types.
+    Preserves behavior from previous implementation.
     """
+    try:
+        import numpy as _np  # type: ignore
+        import pandas as _pd  # type: ignore
+    except Exception:
+        _np = None
+        _pd = None
+
     from pathlib import Path as _Path
 
     if obj is None or isinstance(obj, (str, bool, int, float)):
         return obj
-    if HAS_NUMPY and _np is not None:
-        try:
-            if isinstance(obj, (_np.integer,)):
-                return int(obj)
-            if isinstance(obj, (_np.floating,)):
-                return float(obj)
-        except Exception:
-            pass
-    if HAS_PANDAS and _pd is not None:
+    if _np is not None:
+        if isinstance(obj, (_np.integer,)):
+            return int(obj)
+        if isinstance(obj, (_np.floating,)):
+            return float(obj)
+    if _pd is not None:
         try:
             if isinstance(obj, _pd.Timestamp):
                 return obj.isoformat()
@@ -175,7 +173,7 @@ def make_json_safe(obj: Any) -> Any:
     if isinstance(obj, _Path):
         return str(obj)
     if isinstance(obj, dict):
-        out: Dict[str, Any] = {}
+        out = {}
         for k, v in obj.items():
             try:
                 out[str(k)] = make_json_safe(v)
@@ -184,7 +182,6 @@ def make_json_safe(obj: Any) -> Any:
         return out
     if isinstance(obj, (list, tuple, set)):
         return [make_json_safe(x) for x in obj]
-    # last resort: try json roundtrip for simple serializable objects
     try:
         return json.loads(json.dumps(obj))
     except Exception:
@@ -203,6 +200,7 @@ def safe_float(x, default=None):
 # ---------------------------
 # PDF text extraction
 # ---------------------------
+
 
 def extract_text_from_pdf(pdf_path: Path, max_pages: Optional[int] = 200) -> str:
     """
@@ -224,17 +222,15 @@ def extract_text_from_pdf(pdf_path: Path, max_pages: Optional[int] = 200) -> str
                     txt = ""
                 if txt:
                     parts.append(txt)
-                # early exit if we've captured a lot of text already
-                if sum(len(x) for x in parts) > 30000:
-                    break
         return "\n".join(parts)
     except Exception:
         return ""
 
 
 # ---------------------------
-# Announcement datetime extraction (single canonical helper)
+# Announcement datetime extraction
 # ---------------------------
+
 
 def _extract_datetime_from_filename_local(filename: str) -> Optional[Dict[str, str]]:
     """
@@ -245,7 +241,7 @@ def _extract_datetime_from_filename_local(filename: str) -> Optional[Dict[str, s
     if not filename:
         return None
     name = Path(filename).name
-    # Try explicit DD-MM-YYYY HH_mm_ss or variants first
+    # DD-MM-YYYY HH_mm_ss or with colons
     m = re.search(r'(?P<d>\d{2}-\d{2}-\d{4})[ _-]+(?P<h>\d{2})[:_](?P<m>\d{2})[:_](?P<s>\d{2})', name)
     if m:
         try:
@@ -254,8 +250,8 @@ def _extract_datetime_from_filename_local(filename: str) -> Optional[Dict[str, s
             return {"iso": dt.isoformat(), "human": dt.strftime("%d-%b-%Y, %H:%M:%S")}
         except Exception:
             pass
-    # YYYY-MM-DD or YYYYMMDD (strict separators or continuous)
-    m2 = re.search(r'(?<!\d)(?P<Y>\d{4})[-_]?((?P<M>\d{2})[-_]?((?P<D>\d{2})))(?!\d)', name)
+    # YYYY-MM-DD or YYYYMMDD
+    m2 = re.search(r'(?P<Y>\d{4})[-_]?((?P<M>\d{2})[-_]?((?P<D>\d{2})))', name)
     if m2:
         try:
             Y = int(m2.group("Y")); M = int(m2.group("M")); D = int(m2.group("D"))
@@ -277,12 +273,11 @@ def _extract_datetime_from_filename_local(filename: str) -> Optional[Dict[str, s
 def extract_datetime_from_filename(filename: str) -> Optional[Dict[str, str]]:
     """
     Wrapper that uses filename_utils.extract_datetime_from_filename if available,
-    otherwise falls back to local parser above. Always returns dict or None.
+    otherwise falls back to local parser above.
     """
     try:
         if hasattr(filename_utils, "extract_datetime_from_filename"):
             dt = filename_utils.extract_datetime_from_filename(filename)
-            # normalize possible return shapes
             if isinstance(dt, tuple) and len(dt) == 2:
                 iso, human = dt
                 if iso or human:
@@ -295,49 +290,24 @@ def extract_datetime_from_filename(filename: str) -> Optional[Dict[str, str]]:
 
 
 # ---------------------------
-# Market snapshot & images enrichment (with caching)
+# Market snapshot & images enrichment
 # ---------------------------
-
-@lru_cache(maxsize=1024)
-def _cached_get_market_snapshot(symbol: str) -> Dict[str, Any]:
-    try:
-        return csv_utils.get_market_snapshot(symbol) or {}
-    except Exception:
-        return {}
-
-
-@lru_cache(maxsize=1024)
-def _cached_get_indices_for_symbol(symbol: str) -> Tuple[str, str]:
-    try:
-        return csv_utils.get_indices_for_symbol(symbol)
-    except Exception:
-        return ("Uncategorised Index", "Uncategorised Sector")
-
-
-@lru_cache(maxsize=1024)
-def _cached_get_logo_banner(symbol: str, company_name: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
-    try:
-        lp, lu = image_utils.get_logo_path(symbol, company_name)
-        bp, bu = image_utils.get_banner_path(symbol, company_name)
-        return (str(lp) if lp is not None else None, lu, str(bp) if bp is not None else None, bu)
-    except Exception:
-        return (None, None, None, None)
 
 
 def enrich_with_market_and_indices(symbol: str) -> Optional[Dict[str, Any]]:
     """
     Return a normalized market snapshot (JSON-ready) or None.
-    Uses cached csv_utils/get_indices and image paths.
+    Uses csv_utils.get_market_snapshot + get_indices_for_symbol and image_utils for images.
     """
     if not symbol:
         return None
-    snap = _cached_get_market_snapshot(symbol)
+    snap = csv_utils.get_market_snapshot(symbol) or {}
     keys = [
         "symbol", "company_name", "rank", "price", "change_1d_pct", "change_1w_pct", "vwap", "mcap_rs_cr",
         "volume_24h_rs_cr", "all_time_high", "atr_pct", "relative_vol", "vol_change_pct", "volatility",
         "market_snapshot_date", "logo_url", "banner_url"
     ]
-    normalized: Dict[str, Any] = {k: snap.get(k) if snap.get(k) is not None else None for k in keys}
+    normalized = {k: snap.get(k) if snap.get(k) is not None else None for k in keys}
 
     # numeric conversions (best-effort)
     for k in ("price", "vwap", "mcap_rs_cr", "volume_24h_rs_cr", "all_time_high", "atr_pct", "relative_vol", "vol_change_pct", "volatility", "rank"):
@@ -351,15 +321,20 @@ def enrich_with_market_and_indices(symbol: str) -> Optional[Dict[str, Any]]:
             except Exception:
                 normalized[k] = v
 
-    broad, sector = _cached_get_indices_for_symbol(symbol)
+    # attach indices
+    try:
+        broad, sector = csv_utils.get_indices_for_symbol(symbol)
+    except Exception:
+        broad, sector = ("Uncategorised Index", "Uncategorised Sector")
     normalized["broad_index"] = broad
     normalized["sector_index"] = sector
 
-    # attach cached images
+    # attach images (best-effort)
     try:
-        lp, lu, bp, bu = _cached_get_logo_banner(symbol, normalized.get("company_name") or "")
-        normalized["logo_url"] = [lp, lu] if lp is not None else None
-        normalized["banner_url"] = [bp, bu] if bp is not None else None
+        lp, lu = image_utils.get_logo_path(symbol, normalized.get("company_name") or "")
+        bp, bu = image_utils.get_banner_path(symbol, normalized.get("company_name") or "")
+        normalized["logo_url"] = [str(lp), lu] if lp is not None else None
+        normalized["banner_url"] = [str(bp), bu] if bp is not None else None
     except Exception:
         pass
 
@@ -370,7 +345,13 @@ def enrich_with_market_and_indices(symbol: str) -> Optional[Dict[str, Any]]:
 # Filename matching (delegates to filename_utils when available)
 # ---------------------------
 
+
 def match_filename(filename: str) -> Dict[str, Any]:
+    """
+    Use filename_utils.filename_to_symbol() to determine canonical symbol/company.
+    Returns an event-like dict with keys: found, symbol, company_name, score, match_type, candidates.
+    Falls back to index_builder direct APIs if filename_utils not available.
+    """
     ev = {"found": False, "symbol": None, "company_name": None, "score": 0.0, "match_type": "no_match", "candidates": []}
     try:
         if hasattr(filename_utils, "filename_to_symbol"):
@@ -391,6 +372,7 @@ def match_filename(filename: str) -> Dict[str, Any]:
                 })
                 return ev
     except Exception:
+        # We'll fall through to index_builder fallbacks.
         pass
 
     # index_builder direct fallbacks (best-effort)
@@ -398,6 +380,7 @@ def match_filename(filename: str) -> Dict[str, Any]:
         base_no_ext = re.sub(r'[\-_.]+', ' ', Path(filename).name.rsplit(".", 1)[0]).strip()
         tokens = [t for t in re.split(r'\s+', base_no_ext) if t and not t.isdigit() and len(t) >= 2]
 
+        # exact token match
         for t in tokens:
             sym = index_builder.get_symbol_by_exact(t)
             if sym:
@@ -405,6 +388,7 @@ def match_filename(filename: str) -> Dict[str, Any]:
                 ev.update({"found": True, "symbol": sym, "company_name": row.get("company_name") if row else None, "score": 1.0, "match_type": "exact"})
                 return ev
 
+        # token -> single symbol
         for t in tokens:
             sym = index_builder.get_symbol_by_token(t)
             if sym:
@@ -412,6 +396,7 @@ def match_filename(filename: str) -> Dict[str, Any]:
                 ev.update({"found": True, "symbol": sym, "company_name": row.get("company_name") if row else None, "score": 0.85, "match_type": "token"})
                 return ev
 
+        # token overlap
         overlap = index_builder.token_overlap_search(tokens, min_score=0.55)
         if overlap:
             sym, score = overlap
@@ -419,6 +404,7 @@ def match_filename(filename: str) -> Dict[str, Any]:
             ev.update({"found": True, "symbol": sym, "company_name": row.get("company_name") if row else None, "score": float(score), "match_type": "token_overlap"})
             return ev
 
+        # fuzzy
         fuzzy = index_builder.fuzzy_lookup_symbol(base_no_ext)
         if fuzzy:
             row = index_builder.get_company_by_symbol(fuzzy)
@@ -427,7 +413,7 @@ def match_filename(filename: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # final fallback: attempt filename_utils without csv_path if present
+    # final fallback: call filename_utils.filename_to_symbol without csv_path if present
     try:
         if hasattr(filename_utils, "filename_to_symbol"):
             res = filename_utils.filename_to_symbol(filename)
@@ -441,10 +427,14 @@ def match_filename(filename: str) -> Dict[str, Any]:
 
 
 # ---------------------------
-# JSON atomic writer
+# JSON atomic writer & helpers
 # ---------------------------
 
+
 def write_master_json(out_path: Path, data: Dict[str, Any]):
+    """
+    Write JSON atomically using tmp file and os.replace to ensure atomicity.
+    """
     tmp = out_path.with_suffix(out_path.suffix + ".tmp")
     tmp.parent.mkdir(parents=True, exist_ok=True)
     with tmp.open("w", encoding="utf-8") as fh:
@@ -453,6 +443,7 @@ def write_master_json(out_path: Path, data: Dict[str, Any]):
 
 
 def _validate_headline(h: Optional[str]) -> bool:
+    """Return True when headline appears plausible."""
     if not h or not isinstance(h, str):
         return False
     h = h.strip()
@@ -466,6 +457,7 @@ def _validate_headline(h: Optional[str]) -> bool:
 
 
 def deterministic_headline_from_summary(summary: Optional[str]) -> Optional[str]:
+    """Fallback headline derived deterministically from summary text (first ~14 words)."""
     if not summary:
         return None
     s = summary.strip().replace("\n", " ")
@@ -480,7 +472,15 @@ def deterministic_headline_from_summary(summary: Optional[str]) -> Optional[str]
 # Core local PDF processing
 # ---------------------------
 
+
 def process_pdf(pdf_path: Path, dry_run: bool = False, force: bool = False) -> Dict[str, Any]:
+    """
+    Process a single local PDF Path into the master JSON dict and move the PDF (unless dry_run).
+    Returns the master dict.
+
+    Note: This function expects a local Path. For S3 inputs use process_single_pdf which
+    downloads the object and calls process_pdf() internally.
+    """
     evts: List[Dict[str, Any]] = []
     evts.append({"event": "start", "ts": now_iso(), "file": str(pdf_path)})
 
@@ -495,31 +495,47 @@ def process_pdf(pdf_path: Path, dry_run: bool = False, force: bool = False) -> D
         canonical_symbol = match.get("symbol")
         canonical_company_name = match.get("company_name")
 
-        # 2) announcement datetime (single canonical call)
-        dt_info = extract_datetime_from_filename(pdf_path.name) or {}
+        # 2) announcement datetime (filename_utils preferred)
+        dt_info = None
+        try:
+            if hasattr(filename_utils, "extract_datetime_from_filename"):
+                dt_res = filename_utils.extract_datetime_from_filename(pdf_path.name)
+                if isinstance(dt_res, tuple) and len(dt_res) == 2:
+                    iso, human = dt_res
+                    dt_info = {"iso": iso, "human": human} if (iso or human) else None
+                elif isinstance(dt_res, dict):
+                    dt_info = dt_res
+        except Exception:
+            dt_info = None
+        if not dt_info:
+            dt_info = extract_datetime_from_filename(pdf_path.name) or {}
+
         announcement_iso = dt_info.get("iso")
         announcement_human = dt_info.get("human")
 
-        # 3) extract text (pypdf handled internally)
-        body_text = extract_text_from_pdf(pdf_path)
+        # 3) extract text (pypdf) - may be empty if binary scan or pypdf unavailable
+        body_text = extract_text_from_pdf(pdf_path) if PdfReader else ""
         evts.append({"event": "text_extracted", "ts": now_iso(), "chars": len(body_text)})
 
-        # 4) enrichment (market snapshot + indices + images) - cached
+        # 4) enrichment
         market_snapshot = enrich_with_market_and_indices(canonical_symbol) if canonical_symbol else None
         evts.append({"event": "enrichment_done", "ts": now_iso(), "market_snapshot_found": bool(market_snapshot)})
 
-        # 5) images: resolved during enrichment; reuse values from market_snapshot
+        # 5) images
         company_logo = None
         banner_image = None
-        if market_snapshot:
-            lp = market_snapshot.get("logo_url")
-            bp = market_snapshot.get("banner_url")
-            # market_snapshot.logo_url is [path, public_url] per enrichment
-            company_logo = lp[0] if isinstance(lp, list) and lp and lp[0] else None
-            banner_image = bp[0] if isinstance(bp, list) and bp and bp[0] else None
+        if canonical_symbol:
+            try:
+                logo_path, logo_pub = image_utils.get_logo_path(canonical_symbol, canonical_company_name or "")
+                banner_path, banner_pub = image_utils.get_banner_path(canonical_symbol, canonical_company_name or "")
+                company_logo = str(logo_path) if logo_path is not None else None
+                banner_image = str(banner_path) if banner_path is not None else None
+            except Exception:
+                company_logo = None
+                banner_image = None
 
         # 6) LLM: headline + summary
-        llm_meta: Dict[str, Any] = {"ok": False}
+        llm_meta = {"used": False}
         headline_ai = None
         headline_final = None
         summary_60 = None
@@ -578,7 +594,7 @@ def process_pdf(pdf_path: Path, dry_run: bool = False, force: bool = False) -> D
         safe_iso = iso_for_id.replace(":", "").replace("-", "").split("+")[0]
         file_id = f"ann_{safe_iso}_{sha1[:16]}"
 
-        master: Dict[str, Any] = {
+        master = {
             "id": file_id,
             "sha1": sha1,
             "canonical_symbol": canonical_symbol,
@@ -599,14 +615,14 @@ def process_pdf(pdf_path: Path, dry_run: bool = False, force: bool = False) -> D
                         market_snapshot.get("sector_index") if market_snapshot else "Uncategorised Sector"],
             "company_logo": company_logo,
             "banner_image": banner_image,
-            "tradingview_url": (f"https://www.tradingview.com/symbols/NSE-{canonical_symbol}/" if canonical_symbol else None),
+            "tradingview_url": f"https://www.tradingview.com/symbols/NSE-{canonical_symbol}/" if canonical_symbol else None,
             "sentiment_badge": sent,
             "llm_metadata": {"used": bool(llm_meta.get("ok")), "model": llm_meta.get("model") if isinstance(llm_meta, dict) else None},
             "keywords": sent.get("raw_responses", {}).get("keyword", {}).get("matches", {}).get("positive", []),
             "processing_events": evts,
             "final_status": "processed",
             "created_at": created_at,
-            "version": VERSION,
+            "version": VERSION
         }
 
         # 9) Write JSON locally and move PDF to local processed folder (date-based)
@@ -655,6 +671,7 @@ def process_pdf(pdf_path: Path, dry_run: bool = False, force: bool = False) -> D
                 json.dump(make_json_safe({"processing_events": evts, "trace": tb}), fh, ensure_ascii=False, indent=2)
         except Exception:
             pass
+        # re-raise to let CLI/caller see failure
         raise
 
 
@@ -662,11 +679,16 @@ def process_pdf(pdf_path: Path, dry_run: bool = False, force: bool = False) -> D
 # S3-aware wrapper (S3-first, local fallback)
 # ---------------------------
 
+
 def _is_s3_uri(u: str) -> bool:
     return isinstance(u, str) and u.lower().startswith("s3://")
 
 
 def _parse_s3_uri(u: str) -> Tuple[str, str]:
+    """
+    Return (bucket, key) for a valid s3://bucket/key URI.
+    Raises ValueError if invalid.
+    """
     m = re.match(r"s3://([^/]+)/(.+)", u)
     if not m:
         raise ValueError(f"Invalid S3 URI: {u}")
@@ -681,23 +703,42 @@ def process_single_pdf(
     delete_after: bool = False,
     download_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
+    """
+    S3-aware wrapper that accepts:
+      - local path string OR
+      - s3://bucket/key.pdf
+
+    Behavior:
+      - If S3 URI: download to temp file (fsspec preferred, boto3 fallback), call process_pdf(local_path),
+        then upload:
+           * processed PDF -> s3://<bucket>/input_data/pdf/processed/<YYYY-MM-DD>/<filename>
+           * JSON -> s3://<bucket>/data/announcements/<YYYY-MM-DD>/<file_id>.json
+      - If local path: call process_pdf(path) (local behavior unchanged).
+      - Respects overwrite flag for S3 uploads (if overwrite False, will skip existing target).
+      - Returns {"master": master_dict, "upload": {...}} where upload contains upload booleans and error list.
+    """
     upload_results = {"pdf_uploaded": False, "json_uploaded": False, "errors": []}
     is_s3 = _is_s3_uri(str(s3_or_local_path))
     local_temp: Optional[Path] = None
     cleanup_paths: List[Path] = []
 
+    # Helper to upload file via fsspec or boto3
     def _upload_file_to_s3(local_file: Path, bucket: str, key: str, allow_overwrite: bool) -> bool:
+        # prefer fsspec
         if fsspec is not None:
             try:
                 fs = fsspec.filesystem("s3")
+                # Check existence if not overwrite
                 exists = False
                 if not allow_overwrite:
                     try:
                         exists = fs.exists(f"s3://{bucket}/{key}")
                     except Exception:
+                        # ignore existence check errors and attempt upload
                         exists = False
                 if exists and not allow_overwrite:
                     return False
+                # Use a binary stream copy
                 with fs.open(f"s3://{bucket}/{key}", "wb") as w, local_file.open("rb") as r:
                     while True:
                         chunk = r.read(16 * 1024)
@@ -706,15 +747,19 @@ def process_single_pdf(
                         w.write(chunk)
                 return True
             except Exception as e:
+                # fallback to boto3 if available
                 upload_results["errors"].append(f"fsspec upload failed for s3://{bucket}/{key} : {e}")
         if boto3 is not None:
             try:
                 s3c = boto3.client("s3")
                 if not allow_overwrite:
+                    # Check existence by head_object
                     try:
                         s3c.head_object(Bucket=bucket, Key=key)
+                        # exists
                         return False
                     except Exception:
+                        # not exists proceed
                         pass
                 s3c.upload_file(str(local_file), bucket, key)
                 return True
@@ -729,10 +774,12 @@ def process_single_pdf(
         if is_s3:
             s3_uri = str(s3_or_local_path)
             bucket, key = _parse_s3_uri(s3_uri)
+            # choose temp dir
             tmp_dir = download_dir or Path(tempfile.gettempdir())
             tmp_dir.mkdir(parents=True, exist_ok=True)
             local_name = Path(key).name
             local_temp = tmp_dir / f"{uuid.uuid4().hex[:8]}_{local_name}"
+            # Download via fsspec preferred
             downloaded = False
             if fsspec is not None:
                 try:
@@ -748,6 +795,7 @@ def process_single_pdf(
                     download_err = f"fsspec download failed for {s3_uri}: {e}"
                     upload_results["errors"].append(download_err)
                     downloaded = False
+            # boto3 fallback
             if not downloaded:
                 if boto3 is None:
                     upload_results["errors"].append("boto3 not installed and fsspec download failed; cannot download S3 object.")
@@ -789,18 +837,24 @@ def process_single_pdf(
             json_name = f"{file_id}.json"
             pdf_name = Path(master.get("source_file_normalized") or local_pdf_path.name).name
 
-            # S3 key targets (use S3_BUCKET_ROOT env var if present)
-            bucket_root = os.getenv('S3_BUCKET_ROOT', '').rstrip('/')
+            # S3 key targets (allow optional bucket_root prefix)
+            # Root S3 prefix (if provided via s3_prefix or env fallback)
+            bucket_root = s3_prefix.rstrip('/') if ('s3_prefix' in locals() and s3_prefix) else (os.getenv('S3_BUCKET_ROOT','').rstrip('/') if os.getenv('S3_BUCKET_ROOT') else '')
+            # PDF processed S3 key: <bucket_root>/input_data/pdf/processed/<date_folder>/<filename>
             pdf_key = f"{bucket_root}/input_data/pdf/processed/{date_folder}/{pdf_name}".lstrip('/')
+            # JSON S3 key: <bucket_root>/data/announcements/<date_folder>/<file_id>.json
             json_key = f"{bucket_root}/data/announcements/{date_folder}/{json_name}".lstrip('/')
 
+            # --- NEW: populate expected S3 URIs on the master regardless of dry_run ---
             try:
                 master['s3_output_json'] = f"s3://{bucket}/{json_key}"
                 master['s3_output_pdf'] = f"s3://{bucket}/{pdf_key}"
             except Exception:
+                # defensive: if master isn't a dict for some reason, ignore
                 pass
+            # --- end NEW ---
 
-            # upload JSON
+            # upload JSON (write to tmp json and upload)
             with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w", encoding="utf-8") as jf:
                 json.dump(make_json_safe(master), jf, ensure_ascii=False, indent=2)
                 jf_path = Path(jf.name)
@@ -811,7 +865,8 @@ def process_single_pdf(
             if json_ok:
                 master["s3_output_json"] = f"s3://{bucket}/{json_key}"
 
-            # determine processed PDF local candidate
+            # upload processed PDF (local file processed could have been moved by process_pdf to local processed folder).
+            # prefer the moved location recorded in master.processing_events if present
             processed_local_candidate: Optional[Path] = None
             for ev in reversed(master.get("processing_events", []) or []):
                 if ev.get("event") == "moved_pdf" and ev.get("to"):
@@ -819,6 +874,7 @@ def process_single_pdf(
                     if cand.exists():
                         processed_local_candidate = cand
                         break
+            # fallback to the local_temp or local_pdf_path used for processing
             if processed_local_candidate is None:
                 processed_local_candidate = local_pdf_path
 
@@ -827,7 +883,9 @@ def process_single_pdf(
             if pdf_ok:
                 master["s3_output_pdf"] = f"s3://{bucket}/{pdf_key}"
 
+            # Optionally delete original S3 object
             if delete_after:
+                # use boto3 if available to delete
                 if boto3 is not None:
                     s3c = boto3.client("s3")
                     try:
@@ -838,11 +896,13 @@ def process_single_pdf(
                 else:
                     upload_results["errors"].append("delete_after requested but boto3 not installed; cannot delete original S3 object.")
         else:
+            # local-only: nothing further to upload. All writes already happened in process_pdf
             pass
 
         return {"master": master, "upload": upload_results}
 
     finally:
+        # cleanup any temporary files we created
         for p in cleanup_paths:
             try:
                 if p.exists():
@@ -855,6 +915,7 @@ def process_single_pdf(
 # CLI
 # ---------------------------
 
+
 def _cli():
     parser = argparse.ArgumentParser(description="pdf_processor - process pdf into master JSON (S3-aware)")
     parser.add_argument("--src", help="Source PDF path or s3 URI (e.g. s3://bucket/input_data/pdf/foo.pdf or input_data/pdf/foo.pdf)", required=True)
@@ -865,20 +926,13 @@ def _cli():
     args = parser.parse_args()
 
     src = args.src
+    # warm caches (best-effort)
     try:
-        if getattr(csv_utils, "load_processed_df", None):
-            try:
-                csv_utils.load_processed_df(force_reload=False)
-            except Exception:
-                pass
+        csv_utils.load_processed_df(force_reload=False)
     except Exception:
         pass
     try:
-        if getattr(index_builder, "refresh_index", None):
-            try:
-                index_builder.refresh_index()
-            except Exception:
-                pass
+        index_builder.refresh_index()
     except Exception:
         pass
 

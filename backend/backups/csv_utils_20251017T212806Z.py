@@ -1,73 +1,67 @@
 #!/usr/bin/env python3
 """
-csv_utils_optimized.py - trimmed / clearer version of csv_utils.py
-This file preserves public functions and CLI of the original while reducing
-small redundancies, improving robustness around S3 vs local Path handling,
-and keeping docstrings, comments and logs for auditability.
+csv_utils.py - helper for processed EOD CSV + indices lookup (dynamic CLI)
 
-Behavior and exported functions are intentionally unchanged:
- - find_latest_processed_eod()
- - load_processed_df()
- - get_market_snapshot()
- - load_indices_df()
- - get_indices_for_symbol()
- - list_symbols()
- - format_snapshot_for_display()
- - CLI entrypoint (_cli)
+Usage examples (from backend/):
+  .venv/bin/python services/csv_utils.py --symbol NDTV
+  .venv/bin/python services/csv_utils.py --list
+  .venv/bin/python services/csv_utils.py --symbol RELIANCE --json
+
+Expectations:
+ - Processed EOD CSVs in: input_data/csv/processed_csv/
+ - Indices CSV in:         input_data/csv/static/
+ - Processed CSV should have canonical columns (but we try to be permissive).
 """
+from __future__ import annotations
+
 import argparse
 import json
 import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 
+# Try to import s3fs/fsspec lazily inside functions; don't fail import here if missing.
+# Keep base paths relative to the project.
 BASE = Path(__file__).resolve().parents[1]
 
-# Local defaults (backwards-compatible)
 LOCAL_PROCESSED_DIR = BASE / "input_data" / "csv" / "processed_csv"
 LOCAL_STATIC_DIR = BASE / "input_data" / "csv" / "static"
 
-# Environment overrides (useful for S3)
+# Environment overrides (allow empty -> None)
 _s3_proc_env = os.getenv("S3_PROCESSED_CSV_PATH", "")
-S3_PROCESSED_CSV_PATH = _s3_proc_env.strip() or None
+S3_PROCESSED_CSV_PATH: Optional[str] = _s3_proc_env.strip() or None
 _s3_static_env = os.getenv("S3_STATIC_CSV_PATH", "")
-S3_STATIC_CSV_PATH = _s3_static_env.strip() or None
+S3_STATIC_CSV_PATH: Optional[str] = _s3_static_env.strip() or None
 
-# If env var present and looks like s3://..., use it. Otherwise use local Path objects.
+# Keep PROCESSED_DIR/STATIC_DIR as either Path or string (for S3).
 if S3_PROCESSED_CSV_PATH and S3_PROCESSED_CSV_PATH.lower().startswith("s3://"):
     PROCESSED_S3 = True
-    PROCESSED_DIR = S3_PROCESSED_CSV_PATH.rstrip("/")  # keep as string when S3
+    PROCESSED_DIR: Union[str, Path] = S3_PROCESSED_CSV_PATH.rstrip("/")
 else:
     PROCESSED_S3 = False
     PROCESSED_DIR = LOCAL_PROCESSED_DIR
 
 if S3_STATIC_CSV_PATH and S3_STATIC_CSV_PATH.lower().startswith("s3://"):
     STATIC_S3 = True
-    STATIC_DIR = S3_STATIC_CSV_PATH.rstrip("/")
+    STATIC_DIR: Union[str, Path] = S3_STATIC_CSV_PATH.rstrip("/")
 else:
     STATIC_S3 = False
     STATIC_DIR = LOCAL_STATIC_DIR
 
-# Optional s3fs import (allowed to be absent)
-try:
-    import s3fs  # type: ignore
-except Exception:
-    s3fs = None  # type: ignore
-
 # caches
 _EOD_DF: Optional[pd.DataFrame] = None
-_EOD_PATH: Optional[Path] = None
+_EOD_PATH: Optional[Union[str, Path]] = None
 _INDICES_DF: Optional[pd.DataFrame] = None
-_INDICES_PATH: Optional[Path] = None
+_INDICES_PATH: Optional[Union[str, Path]] = None
 
-# regex for date extraction from filenames: 2025-09-24 or 20250924 or 2025_09_24
+# Date regex matches: 2025-09-24 or 20250924 or 2025_09_24
 DATE_RE = re.compile(r"(\d{4})[-_]?(\d{2})[-_]?(\d{2})")
 
-# broad index priority
+# broad index priority (used to pick a preferred broad index from indices CSV)
 BROAD_PRIORITY = [
     "NIFTY50",
     "NIFTYNEXT50",
@@ -80,73 +74,92 @@ BROAD_PRIORITY = [
 ]
 
 
-def _log(*args, **kwargs):
-    """Small helper print to stderr for logs (kept as original)."""
+def _log(*args: Any, **kwargs: Any) -> None:
+    """Helper to print logs to stderr."""
     print(*args, file=sys.stderr, **kwargs)
 
 
-# ---- file discovery / loading ------------------------------------------------
-def _ensure_s3_uri(val: str) -> str:
-    """Normalize and ensure a returned S3 key is a full s3:// URI."""
-    if not isinstance(val, str):
-        return val
-    v = val.rstrip("/")
-    if v and v.lower().startswith("s3://"):
-        return v
-    # If fsspec returned bare key like 'bucket/...', prepend scheme
-    if "/" in v and not v.lower().startswith("s3://"):
-        return "s3://" + v.lstrip("/")
-    return v
+# ---- helpers ----------------------------------------------------------------
+def _ensure_s3_uri(candidate: Union[str, Path]) -> str:
+    """Return a normalized s3://... URI string for a candidate that may be a bare key."""
+    s = str(candidate)
+    s = s.strip().lstrip("/")
+    if not s.lower().startswith("s3://"):
+        return "s3://" + s
+    return s
 
 
-def find_latest_processed_eod() -> Optional[Path]:
-    """Return newest processed_*.csv in PROCESSED_DIR or S3 path string.
+def _filename_from_path(p: Union[str, Path]) -> str:
+    """Return the filename portion from a pathlib.Path or an s3://... string."""
+    if hasattr(p, "name"):
+        # pathlib.Path-like
+        return p.name
+    s = str(p).rstrip("/")
+    return s.split("/")[-1]
 
-    This version is S3-first and mirrors the behaviour used in services.image_utils:
-      - read S3 configuration at module import time (PROCESSED_S3 / PROCESSED_DIR)
-      - use fsspec when available to list S3 prefixes
-      - return an `s3://...` string for S3 results, otherwise return a pathlib.Path
+
+# ---- file discovery / loading ----------------------------------------------
+def find_latest_processed_eod() -> Optional[Union[str, Path]]:
     """
-    # If module-level flag indicates PROCESSED_DIR is an S3 prefix, try S3 listing first
-    if PROCESSED_S3:
-        try:
-            import fsspec
-            fs = fsspec.filesystem("s3")
-            prefix = str(PROCESSED_DIR).rstrip("/")
-            # prefer processed_*.csv then any .csv
-            candidates = fs.glob(f"{prefix}/processed_*.csv") or fs.glob(f"{prefix}/*.csv")
-            if candidates:
-                # prefer dated filenames when present
-                dated: List[Tuple[pd.Timestamp, str]] = []
-                for p in candidates:
-                    name = str(p).split("/")[-1]
-                    m = DATE_RE.search(name)
-                    if m:
-                        try:
-                            y, mo, d = map(int, m.groups())
-                            ts = pd.Timestamp(year=y, month=mo, day=d)
-                            dated.append((ts, str(p)))
-                        except Exception:
-                            continue
-                if dated:
-                    dated.sort(key=lambda x: x[0], reverse=True)
-                    return _ensure_s3_uri(dated[0][1])
-                # fallback to lexicographic newest
-                return _ensure_s3_uri(sorted(map(str, candidates))[-1])
-        except Exception:
-            _log("s3 listing failed - falling back to local discovery")
+    Return newest processed_*.csv in PROCESSED_DIR or S3 path set by env var.
 
-    # Local filesystem fallback (PROCESSED_DIR may be a Path or string)
-    local_processed_dir = Path(PROCESSED_DIR) if not isinstance(PROCESSED_DIR, str) else Path(str(PROCESSED_DIR))
+    If an S3 env is configured, this will attempt to list that S3 location
+    (via fsspec) and return a full 's3://...' URI string for the newest match.
+    Otherwise it returns a pathlib.Path to the local file.
+    """
+    # prefer explicit env var if present (robust to missing scheme)
+    s3_env = (os.getenv("S3_PROCESSED_CSV_PATH") or "").strip()
+    if s3_env and not s3_env.lower().startswith("s3://") and "nexo-storage-ca" in s3_env:
+        s3_env = "s3://" + s3_env.lstrip("/")
+
+    if s3_env:
+        try:
+            # import lazily so module import doesn't fail when fsspec missing
+            import fsspec  # type: ignore
+
+            fs = fsspec.filesystem("s3")
+            prefix = s3_env.rstrip("/")
+            # look for processed_*.csv first, then any .csv as fallback
+            candidates = fs.glob(f"{prefix}/processed_*.csv") or fs.glob(f"{prefix}/*.csv")
+            if not candidates:
+                return None
+
+            # try to parse dates from filenames and pick the latest date if present
+            dated: List[Tuple[pd.Timestamp, str]] = []
+            for key in candidates:
+                name = key.split("/")[-1]
+                m = DATE_RE.search(name)
+                if m:
+                    try:
+                        y, mo, d = map(int, m.groups())
+                        ts = pd.Timestamp(year=y, month=mo, day=d)
+                        dated.append((ts, key))
+                    except Exception:
+                        # ignore parse errors on filename
+                        continue
+            if dated:
+                dated.sort(key=lambda x: x[0], reverse=True)
+                ret = dated[0][1]
+                return _ensure_s3_uri(ret)
+
+            # fallback: lexicographically newest candidate
+            ret = sorted(candidates)[-1]
+            return _ensure_s3_uri(ret)
+        except Exception as exc:  # pragma: no cover - defensive
+            _log("S3 listing failed:", exc)
+            # fall through to local checks
+
+    # Local filesystem fallback
+    local_processed_dir = Path(PROCESSED_DIR) if isinstance(PROCESSED_DIR, str) else PROCESSED_DIR
     if not local_processed_dir.exists():
         return None
+
     candidates = list(local_processed_dir.glob("processed_*.csv"))
     if not candidates:
         candidates = list(local_processed_dir.glob("*.csv"))
         if not candidates:
             return None
 
-    # prefer ones with embedded dates
     dated_local: List[Tuple[pd.Timestamp, Path]] = []
     for p in candidates:
         m = DATE_RE.search(p.name)
@@ -160,12 +173,14 @@ def find_latest_processed_eod() -> Optional[Path]:
     if dated_local:
         dated_local.sort(key=lambda x: x[0], reverse=True)
         return dated_local[0][1]
-    # fallback to newest modified
+
+    # fallback to newest modified file
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
 def load_processed_df(force_reload: bool = False) -> Optional[pd.DataFrame]:
-    """Load and cache the latest processed EOD CSV into a pandas DataFrame.
+    """
+    Load and cache the latest processed EOD CSV into a pandas DataFrame.
 
     Supports both local Path and s3://... string returned by find_latest_processed_eod().
     """
@@ -181,35 +196,41 @@ def load_processed_df(force_reload: bool = False) -> Optional[pd.DataFrame]:
 
     _log(f"Loading processed EOD CSV: {p}")
 
-    # Try pandas direct read with storage_options for S3 URIs, else fallback to fsspec file-like.
     try:
+        # s3 URI handling
         if isinstance(p, str) and p.startswith("s3://"):
+            storage_opts = {"anon": False}
             try:
-                df = pd.read_csv(p, low_memory=False, storage_options={"anon": False})
+                # try modern pandas with storage_options
+                df = pd.read_csv(p, low_memory=False, storage_options=storage_opts)
             except TypeError:
-                # older pandas versions may not accept storage_options
-                import fsspec
+                # older pandas; open via fsspec file-like
+                import fsspec  # type: ignore
 
                 fs = fsspec.filesystem("s3")
-                with fs.open(p, "rb") as f:
-                    df = pd.read_csv(f, low_memory=False)
+                with fs.open(p, "rb") as fh:
+                    df = pd.read_csv(fh, low_memory=False)
         else:
+            # local file path (Path)
             try:
                 df = pd.read_csv(p, low_memory=False)
             except Exception:
+                # fallback encoding
                 df = pd.read_csv(p, encoding="latin1", low_memory=False)
-    except Exception:
-        # final fallback: try latin1 with file-like for S3
+    except Exception as exc:  # pragma: no cover - defensive
+        _log("Primary read failed:", exc)
+        # final fallback using latin1 and fsspec if needed
         try:
             if isinstance(p, str) and p.startswith("s3://"):
-                import fsspec
+                import fsspec  # type: ignore
 
                 fs = fsspec.filesystem("s3")
-                with fs.open(p, "rb") as f:
-                    df = pd.read_csv(f, encoding="latin1", low_memory=False)
+                with fs.open(p, "rb") as fh:
+                    df = pd.read_csv(fh, encoding="latin1", low_memory=False)
             else:
                 df = pd.read_csv(p, encoding="latin1", low_memory=False)
-        except Exception:
+        except Exception as exc2:  # pragma: no cover - defensive
+            _log("Final read attempt failed:", exc2)
             _EOD_DF = None
             _EOD_PATH = None
             return None
@@ -221,18 +242,18 @@ def load_processed_df(force_reload: bool = False) -> Optional[pd.DataFrame]:
     return _EOD_DF
 
 
-def _extract_date_from_filename(path: Optional[Path]) -> Optional[str]:
-    """Return date string like '24-Sep-2025' extracted from filename, or None.
+def _extract_date_from_filename(path: Optional[Union[str, Path]]) -> Optional[str]:
+    """
+    Return date string like '24-Sep-2025' extracted from filename, or None.
 
-    Accepts pathlib.Path or an s3://... string; robust to both.
+    Accepts a pathlib.Path or a string (including s3://... URIs) and is robust to both.
     """
     if not path:
         return None
-    # Normalize to filename whether Path or s3 string
     try:
-        name = path.name if hasattr(path, "name") else str(path).rstrip("/").split("/")[-1]
+        name = _filename_from_path(path)
     except Exception:
-        name = str(path).rstrip("/").split("/")[-1]
+        return None
     if not name:
         return None
     m = DATE_RE.search(name)
@@ -245,8 +266,8 @@ def _extract_date_from_filename(path: Optional[Path]) -> Optional[str]:
         return None
 
 
-def _normalize_value(v):
-    """Return None for NA-like values, otherwise the value unchanged."""
+def _normalize_value(v: Any) -> Any:
+    """Return None for NA-like values, otherwise the original value."""
     if pd.isna(v):
         return None
     return v
@@ -254,16 +275,20 @@ def _normalize_value(v):
 
 # ---- market snapshot --------------------------------------------------------
 def get_market_snapshot(symbol: str) -> Optional[Dict[str, Any]]:
-    """Lookup a symbol or company text in the processed EOD DataFrame."""
+    """
+    Lookup a symbol or company text in the processed EOD DataFrame.
+    Returns a dict with canonical keys and market_snapshot_date extracted from filename.
+    """
     if not symbol:
         return None
+
     df = load_processed_df()
     if df is None:
         return None
 
     s = str(symbol).strip().upper()
 
-    # heuristics for symbol / company columns
+    # heuristics for column names
     symbol_cols = [c for c in df.columns if c.strip().lower() in ("symbol", "sym", "ticker")]
     comp_cols = [c for c in df.columns if c.strip().lower() in ("company_name", "company", "description", "company name")]
 
@@ -290,8 +315,7 @@ def get_market_snapshot(symbol: str) -> Optional[Dict[str, Any]]:
 
     row = rows.iloc[0]
 
-    def tryget(*names):
-        """Return first matched column value from row using candidate names."""
+    def tryget(*names: str) -> Any:
         for n in names:
             for c in df.columns:
                 if c.strip().lower() == n.strip().lower():
@@ -318,22 +342,29 @@ def get_market_snapshot(symbol: str) -> Optional[Dict[str, Any]]:
     # attach snapshot date from filename when possible
     snapshot["market_snapshot_date"] = _extract_date_from_filename(_EOD_PATH) if _EOD_PATH else None
 
-    # attach image urls (optional; keep original best-effort signature)
+    # attach image urls (optional, best-effort)
     try:
-        from services.image_utils import get_logo_path, get_banner_path  # optional helper
+        from services.image_utils import get_logo_path, get_banner_path  # type: ignore
     except Exception:
-        def get_logo_path(*a, **k): return None
-        def get_banner_path(*a, **k): return None
+        def get_logo_path(*a: Any, **k: Any) -> Optional[str]:
+            return None
+        def get_banner_path(*a: Any, **k: Any) -> Optional[str]:
+            return None
 
     snapshot["logo_url"] = get_logo_path(snapshot.get("symbol"), snapshot.get("company_name"))
     snapshot["banner_url"] = get_banner_path(snapshot.get("symbol"), snapshot.get("company_name"))
 
-    # convert numeric-like fields to Python floats where sensible (best-effort)
-    for k in ["price", "vwap", "mcap_rs_cr", "volume_24h_rs_cr", "all_time_high", "atr_pct", "relative_vol", "vol_change_pct", "volatility"]:
+    # coerce numerics where sensible
+    numeric_keys = [
+        "price", "vwap", "mcap_rs_cr", "volume_24h_rs_cr", "all_time_high",
+        "atr_pct", "relative_vol", "vol_change_pct", "volatility",
+    ]
+    for k in numeric_keys:
         if k in snapshot and snapshot[k] is not None:
             try:
                 snapshot[k] = float(snapshot[k])
             except Exception:
+                # leave raw if conversion fails
                 pass
 
     return snapshot
@@ -341,12 +372,15 @@ def get_market_snapshot(symbol: str) -> Optional[Dict[str, Any]]:
 
 # ---- indices loading / lookup ----------------------------------------------
 def load_indices_df(force_reload: bool = False) -> Optional[pd.DataFrame]:
-    """Load and cache the broad_and_sector indices CSV from STATIC_DIR (local or S3)."""
+    """
+    Load and cache the broad_and_sector indices CSV from STATIC_DIR.
+
+    Supports local filesystem and S3 prefix (via fsspec) seamlessly.
+    """
     global _INDICES_DF, _INDICES_PATH
     if _INDICES_DF is not None and not force_reload:
         return _INDICES_DF
 
-    # Normalize STATIC_DIR for local checks (may be string when using S3 path)
     local_static_dir = Path(STATIC_DIR) if isinstance(STATIC_DIR, str) else STATIC_DIR
 
     candidates = [
@@ -354,37 +388,39 @@ def load_indices_df(force_reload: bool = False) -> Optional[pd.DataFrame]:
         local_static_dir / "BROAD_AND_SECTOR_INDICES.csv",
         local_static_dir / "broad and sector indices.csv",
     ]
-    found: Optional[Path] = None
+
+    found: Optional[Union[Path, str]] = None
     for p in candidates:
         if isinstance(p, Path) and p.exists():
             found = p
             break
 
+    # fallback local glob
     if found is None and isinstance(local_static_dir, Path) and local_static_dir.exists():
-        # fallback: any CSV with 'sector' or 'index' in name
         for p in local_static_dir.glob("*.csv"):
             if "sector" in p.name.lower() or "index" in p.name.lower():
                 found = p
                 break
 
-    # fallback: check S3 (fsspec)
-    if found is None and S3_STATIC_CSV_PATH and s3fs is not None:
-        fs = s3fs.S3FileSystem()
-        prefix = S3_STATIC_CSV_PATH.rstrip("/")
+    # fallback S3
+    if found is None and S3_STATIC_CSV_PATH:
         try:
-            entries = fs.glob(f"{prefix}/*.csv")
-        except Exception:
-            entries = []
-        for key in entries:
-            name = str(key).split("/")[-1]
-            if "sector" in name.lower() or "index" in name.lower():
-                found = _ensure_s3_uri(str(key))
-                break
+            import fsspec  # type: ignore
+
+            fs = fsspec.filesystem("s3")
+            prefix = S3_STATIC_CSV_PATH.rstrip("/")
+            entries = fs.glob(f"{prefix}/*.csv") or []
+            for key in entries:
+                name = key.split("/")[-1]
+                if "sector" in name.lower() or "index" in name.lower():
+                    found = _ensure_s3_uri(key)
+                    break
+        except Exception as exc:  # pragma: no cover - defensive
+            _log("S3 static listing failed:", exc)
 
     if not found:
         return None
 
-    # robust reading
     try:
         if isinstance(found, str) and found.startswith("s3://"):
             df = pd.read_csv(found, low_memory=False, storage_options={"anon": False})
@@ -406,12 +442,17 @@ def load_indices_df(force_reload: bool = False) -> Optional[pd.DataFrame]:
 
 
 def get_indices_for_symbol(symbol: str) -> Tuple[str, str]:
-    """Return (BroadIndex, SectorialIndex) for a given symbol by best-effort matching."""
+    """
+    Return (BroadIndex, SectorialIndex) for a given symbol.
+    BroadIndex is chosen by priority list; SectorialIndex is the sector name (first token).
+    """
     df = load_indices_df()
     if df is None:
         return ("Uncategorised Index", "Uncategorised Sector")
+
     s = str(symbol).strip().upper()
 
+    # prefer exact match on 'Symbol' column when present
     results = pd.DataFrame()
     if "Symbol" in df.columns:
         results = df[df["Symbol"].astype(str).str.upper() == s]
@@ -420,6 +461,7 @@ def get_indices_for_symbol(symbol: str) -> Tuple[str, str]:
         results = df[df["Description"].astype(str).str.upper().str.contains(re.escape(s))]
 
     if results.empty:
+        # try other common columns
         symbol_cols = [c for c in df.columns if c.strip().lower() in ("symbol", "sym", "ticker")]
         desc_cols = [c for c in df.columns if c.strip().lower() in ("description", "company", "name")]
         if symbol_cols:
@@ -438,7 +480,6 @@ def get_indices_for_symbol(symbol: str) -> Tuple[str, str]:
 
     row = results.iloc[0]
 
-    # sector detection
     sector_raw = None
     for cand in ("SectorialIndex", "Sector", "Sector Name", "Sectorial", "sector"):
         if cand in row.index:
@@ -449,7 +490,6 @@ def get_indices_for_symbol(symbol: str) -> Tuple[str, str]:
     else:
         sector = str(sector_raw).split(",")[0].strip() or "Uncategorised Sector"
 
-    # pick broad by priority
     broad = "Uncategorised Index"
     for b in BROAD_PRIORITY:
         if b in row.index and str(row.get(b)).strip().lower() in ("yes", "y", "true", "1"):
@@ -468,7 +508,7 @@ def format_snapshot_for_display(symbol: str) -> str:
 
     broad, sector = get_indices_for_symbol(symbol)
 
-    def arrow(val):
+    def arrow(val: Any) -> str:
         try:
             f = float(val)
             if f > 0:
@@ -483,19 +523,18 @@ def format_snapshot_for_display(symbol: str) -> str:
     change1d = snap.get("change_1d_pct")
     change1w = snap.get("change_1w_pct")
 
-    s = f"${snap.get('symbol')} | {snap.get('company_name')}\n"
-    s += f"{broad} | {sector}\n\n"
-    s += f"📊 Market Snapshot: |{snap.get('market_snapshot_date')}, EOD|\n"
-    s += f"Price: ₹{price} | {change1d}% (1D) {arrow(change1d)} | {change1w}% (1W) {arrow(change1w)}\n"
-    s += f"Volume (24 Hrs): ₹{snap.get('volume_24h_rs_cr')} Cr\n"
-    s += f"Mcap: ₹{snap.get('mcap_rs_cr')} Cr | Rank: #{snap.get('rank')} by Mcap\n\n"
-    s += f"VWAP: ₹{snap.get('vwap')} | ATR (14D): {snap.get('atr_pct')}%\n"
-    s += f"Relative Vol: {snap.get('relative_vol')} | Vol Change: {snap.get('vol_change_pct')}%\n"
-    s += f"Volatility: {snap.get('volatility')}%\n"
+    s = f\"{snap.get('symbol')} | {snap.get('company_name')}\\n\"
+    s += f\"{broad} | {sector}\\n\\n\"
+    s += f\"📊 Market Snapshot: |{snap.get('market_snapshot_date')}, EOD|\\n\"
+    s += f\"Price: ₹{price} | {change1d}% (1D) {arrow(change1d)} | {change1w}% (1W) {arrow(change1w)}\\n\"
+    s += f\"Volume (24 Hrs): ₹{snap.get('volume_24h_rs_cr')} Cr\\n\"
+    s += f\"Mcap: ₹{snap.get('mcap_rs_cr')} Cr | Rank: #{snap.get('rank')} by Mcap\\n\\n\"
+    s += f\"VWAP: ₹{snap.get('vwap')} | ATR (14D): {snap.get('atr_pct')}%\\n\"
+    s += f\"Relative Vol: {snap.get('relative_vol')} | Vol Change: {snap.get('vol_change_pct')}%\\n\"
+    s += f\"Volatility: {snap.get('volatility')}%\\n\"
     return s.strip()
 
 
-# ---- convenience: list all symbols in latest processed CSV -------------------
 def list_symbols(limit: Optional[int] = None) -> List[str]:
     """Return list of symbols from the latest processed CSV (best-effort)."""
     df = load_processed_df()
@@ -510,14 +549,14 @@ def list_symbols(limit: Optional[int] = None) -> List[str]:
             s = df[comp_cols[0]].astype(str).str.strip().unique().tolist()
         else:
             s = []
-    return s[:limit] if limit else s
+    if limit:
+        return s[:limit]
+    return s
 
 
-# ---------------------------------------------------------------------------
-# CLI Entrypoint (keeps the original CLI behaviour)
-# ---------------------------------------------------------------------------
-def _cli():
-    parser = argparse.ArgumentParser(description="csv_utils_optimized - fetch market snapshot from processed EOD CSV")
+# ---- CLI -------------------------------------------------------------------
+def _cli() -> None:
+    parser = argparse.ArgumentParser(description="csv_utils - fetch market snapshot from processed EOD CSV")
     parser.add_argument("--symbol", help="Stock symbol or company name to lookup")
     parser.add_argument("--list", action="store_true", help="List available symbols (first 200)")
     parser.add_argument("--json", action="store_true", help="Output JSON for --symbol lookup")
@@ -530,7 +569,8 @@ def _cli():
         load_indices_df(force_reload=True)
 
     if args.list:
-        for x in list_symbols(limit=args.limit):
+        syms = list_symbols(limit=args.limit)
+        for x in syms:
             print(x)
         return
 
@@ -542,8 +582,11 @@ def _cli():
                 return
             broad, sector = get_indices_for_symbol(args.symbol)
             snap["broad_index"], snap["sector_index"] = broad, sector
-            print(json.dumps(snap, default=lambda o: None if pd.isna(o) else (int(o) if hasattr(o, "astype") else str(o))))
+            # ensure JSON serializable (numpy types)
+            print(json.dumps(snap, default=lambda o: (None if pd.isna(o) else (int(o) if hasattr(o, "astype") else str(o)))))
             return
+
+        # pretty display
         print(format_snapshot_for_display(args.symbol))
         return
 
