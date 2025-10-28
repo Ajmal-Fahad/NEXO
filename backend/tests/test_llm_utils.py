@@ -488,8 +488,8 @@ async def test_call_with_missing_openai_flag_or_api_key(monkeypatch):
     """If module checks availability flags or env at call time, it should handle missing prerequisites gracefully."""
     # Try toggling any well-known flags
     patched = False
-    if hasattr(iu, "_OPENAI_CLIENT_AVAILABLE"):
-        monkeypatch.setattr(iu, "_OPENAI_CLIENT_AVAILABLE", False)
+    if hasattr(iu, "_OPENAI_AVAILABLE"):
+        monkeypatch.setattr(iu, "_OPENAI_AVAILABLE", False)
         patched = True
     if patched:
         res = await iu.async_call_llm("x")
