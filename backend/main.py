@@ -63,6 +63,15 @@ class Settings(BaseSettings):
         if v.upper() not in valid_levels:
             raise ValueError(f'LOG_LEVEL must be one of {valid_levels}')
         return v.upper()
+# load root .env (idempotent) — ensures env vars are available regardless of CWD
+from pathlib import Path
+from dotenv import load_dotenv
+import os
+
+proj_root = Path(__file__).resolve().parents[1]  # two levels up: backend/ -> project root
+env_path = proj_root / ".env"
+if env_path.exists():
+    load_dotenv(dotenv_path=str(env_path))
 
 settings = Settings()
 
@@ -96,6 +105,19 @@ class RequestIDFilter(logging.Filter):
             record.request_id = "unknown"
         return True
 
+class CorrelationFilter(logging.Filter):
+    """Ensure every record has a correlation_id (fallback to request_id or 'none')."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            # prefer existing context request id if available
+            val = _request_id_ctx.get("unknown")
+        except Exception:
+            val = "unknown"
+        # set both request_id and correlation_id to satisfy formatters that expect either
+        setattr(record, "request_id", getattr(record, "request_id", val))
+        setattr(record, "correlation_id", getattr(record, "correlation_id", val))
+        return True
+
 def setup_logging(log_level: str, environment: str) -> logging.Logger:
     """Configure logging with JSON for production."""
     log_level_int = getattr(logging, log_level.upper(), logging.INFO)
@@ -114,6 +136,7 @@ def setup_logging(log_level: str, environment: str) -> logging.Logger:
 
         # ✅ Add filter so all records carry request_id
         handler.addFilter(RequestIDFilter())
+        handler.addFilter(CorrelationFilter())
 
         logger.setLevel(log_level_int)
         logger.addHandler(handler)
@@ -222,9 +245,26 @@ async def lifespan(app: FastAPI):
     # Startup
     await _maybe_warm_index()
     setup_metrics()
+    
+    # Validate CSV processor settings (fail fast in production)
+    try:
+        from backend.services.csv_processor import preload_settings, validate_settings
+        preload_settings()
+        validate_settings(allow_local_default=settings.ENVIRONMENT.lower() != "prod")
+        logger.info("CSV processor settings validated")
+    except Exception as exc:
+        logger.exception("CSV processor validation failed: %s", exc)
+        raise  # Fail fast - don't start if CSV processing is broken
+    
     logger.info("Application startup complete")
     yield
     # Shutdown
+    try:
+        from backend.services.csv_processor import shutdown_csv_executors
+        shutdown_csv_executors()
+        logger.info("CSV processor executors shut down")
+    except Exception as exc:
+        logger.exception("CSV processor shutdown failed: %s", exc)
     logger.info("Application shutting down")
 
 # ---------- App creation ----------

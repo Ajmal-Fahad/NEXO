@@ -237,15 +237,30 @@ _email_re = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b')
 def _sanitize_input(text: str, max_chars: int = MAX_INPUT_CHARS) -> str:
     if not text:
         return ""
-    truncated = text[:max_chars].strip()
-    # redact emails (basic), extendable for other PII
-    return _email_re.sub("[EMAIL_REDACTED]", truncated)
+    # redact emails first, then truncate
+    redacted = _email_re.sub("[EMAIL_REDACTED]", text)
+    return redacted[:max_chars].strip()
 
-def _safe_str(o: Any) -> str:
+def _safe_str(obj: Any, max_len: int = 100) -> str:
+    """Safe string conversion for logging, etc. Truncates long strings."""
+    if obj is None:
+        return "<none>"
     try:
-        return str(o)
+        s = str(obj)
+        if len(s) > max_len:
+            return s[:max_len] + "...[truncated]"
+        return s
     except Exception:
-        return repr(o)
+        return f"<error converting to str: {obj!r}>"
+
+def _clamp_to_n_words(text: str, max_words: int) -> str:
+    """Clamp text to at most N words (from start)."""
+    if not text or max_words <= 0:
+        return ""
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+    return " ".join(words[:max_words])
 
 def _serialize_usage(usage_obj: Any) -> Optional[Dict[str, Any]]:
     if usage_obj is None:
@@ -371,6 +386,31 @@ async def _invoke_llm_native(
     if not _OPENAI_AVAILABLE:
         return False, RuntimeError("openai package not installed")
 
+    # Check for OpenAI v1.0+ client (preferred)
+    if hasattr(openai, "OpenAI"):
+        try:
+            client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            # Use sync create in threadpool for v1+ client
+            loop = asyncio.get_running_loop()
+            def _sync_call_v1():
+                try:
+                    return client.chat.completions.create(
+                        model=model,
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                    )
+                except Exception as ex:
+                    return ex
+            pool = _get_threadpool()
+            resp_or_exc = await loop.run_in_executor(pool, _sync_call_v1)
+            if isinstance(resp_or_exc, Exception):
+                return False, resp_or_exc
+            return True, resp_or_exc
+        except Exception as e:
+            logger.debug("OpenAI v1+ client failed: %s", _safe_str(e))
+
+    # Fallback to legacy API (for older versions)
     # try to use the modern async endpoints if they exist
     # Some OpenAI packages expose 'ChatCompletion.acreate' for async usage.
     try:
@@ -386,20 +426,42 @@ async def _invoke_llm_native(
 
     # fallback: call sync create in executor (works with legacy or modern sync client)
     loop = asyncio.get_running_loop()
-    def _sync_call():
-        try:
-            chat = getattr(openai, "ChatCompletion", None)
-            if chat and hasattr(chat, "create"):
-                return chat.create(model=model, messages=[{"role": "user", "content": prompt}], max_tokens=max_tokens, temperature=temperature)
-            # else try client-level create (older libs)
-            if hasattr(openai, "Completion") and hasattr(openai.Completion, "create"):
-                return openai.Completion.create(model=model, prompt=prompt, max_tokens=max_tokens, temperature=temperature)
-            raise RuntimeError("No compatible openai ChatCompletion.create / Completion.create available")
-        except Exception as ex:
-            return ex
+    def _call_openai_sync(model, prompt, max_tokens, temperature):
+        # 1) Try new v1+ client shape: client = openai.OpenAI()
+        OpenAIClass = getattr(openai, "OpenAI", None)
+        if OpenAIClass is not None:
+            try:
+                client = OpenAIClass()
+                # v1+ sync path: client.chat.completions.create(...)
+                chat_iface = getattr(client, "chat", None)
+                if chat_iface is not None:
+                    comps = getattr(chat_iface, "completions", None)
+                    if comps is not None and hasattr(comps, "create"):
+                        return comps.create(model=model, messages=[{"role": "user", "content": prompt}], max_tokens=max_tokens, temperature=temperature)
+            except Exception:
+                # keep trying fallbacks
+                pass
 
+        # 2) Older library compatibility: openai.ChatCompletion.create(...)
+        ChatCompletion = getattr(openai, "ChatCompletion", None)
+        if ChatCompletion is not None and hasattr(ChatCompletion, "create"):
+            try:
+                return ChatCompletion.create(model=model, messages=[{"role": "user", "content": prompt}], max_tokens=max_tokens, temperature=temperature)
+            except Exception:
+                # If this errors due to migrated API, continue to next fallback
+                pass
+
+        # 3) Legacy text completions fallback (older SDKs)
+        Completion = getattr(openai, "Completion", None)
+        if Completion is not None and hasattr(Completion, "create"):
+            return Completion.create(model=model, prompt=prompt, max_tokens=max_tokens, temperature=temperature)
+
+        # Nothing compatible found
+        raise RuntimeError("No compatible openai ChatCompletion/Completion API found (check openai SDK version).")
+
+    # Use the helper for the synchronous call site
     pool = _get_threadpool()
-    resp_or_exc = await loop.run_in_executor(pool, _sync_call)
+    resp_or_exc = await loop.run_in_executor(pool, _call_openai_sync, model, prompt, max_tokens, temperature)
     if isinstance(resp_or_exc, Exception):
         return False, resp_or_exc
     return True, resp_or_exc
@@ -573,6 +635,10 @@ async def async_classify_headline_and_summary(text: str) -> Dict[str, Any]:
 
     headline_val = (data.get("headline") or "").strip() or None
     summary_val = (data.get("summary_60") or "").strip() or None
+
+    # Apply word clamp to ensure summary_60 is at most 60 words
+    if summary_val:
+        summary_val = _clamp_to_n_words(summary_val, 60)
 
     meta = {"ok": True, "usage": res.get("usage"), "metrics": res.get("metrics")}
     return {
